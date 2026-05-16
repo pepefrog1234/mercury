@@ -20,9 +20,21 @@
 #include <string.h>
 
 #include <time.h>
+#if !defined(__APPLE__)
 #include <malloc.h>
+#endif
 
 #include "os_interop.h"
+
+#if defined(__APPLE__)
+static void *memalign(size_t alignment, size_t size)
+{
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0)
+        return NULL;
+    return ptr;
+}
+#endif
 
 // Private functions
 
