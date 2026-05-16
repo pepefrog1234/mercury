@@ -52,6 +52,8 @@
 static float cnormf(complex float);
 static void allocate_tx_bpf(struct OFDM *);
 static void deallocate_tx_bpf(struct OFDM *);
+static bool use_post_clip_tx_bpf(struct OFDM *);
+static float tx_bpf_centre_freq(struct OFDM *);
 static float find_carrier_centre(struct OFDM *ofdm);
 static void allocate_rx_bpf(struct OFDM *);
 static void deallocate_rx_bpf(struct OFDM *);
@@ -378,6 +380,8 @@ struct OFDM *ofdm_create(const struct OFDM_CONFIG *config) {
 
   /* Tx and Rx band pass filters */
   ofdm->tx_bpf = NULL;
+  ofdm->tx_post_clip_bpf = NULL;
+  ofdm->tx_post_clip_bpf2 = NULL;
   if (ofdm->tx_bpf_en) allocate_tx_bpf(ofdm);
   ofdm->rx_bpf = NULL;
   if (ofdm->rx_bpf_en) allocate_rx_bpf(ofdm);
@@ -549,15 +553,21 @@ static void allocate_tx_bpf(struct OFDM *ofdm) {
   assert(ofdm->tx_bpf_proto_n != 0);
 
   quisk_filt_cfInit(ofdm->tx_bpf, ofdm->tx_bpf_proto, ofdm->tx_bpf_proto_n);
-  float tx_centre = ofdm->tx_centre;
-  if (!strcmp(ofdm->mode, "datac4") || !strcmp(ofdm->mode, "datac13") ||
-      !strcmp(ofdm->mode, "datac14")) {
-    // Centre the filter on the mean carrier freq, allows a narrower
-    // filter to be used. Only really useful for very narrow, Nc odd
-    // waveforms. TODO: make this feature config controlled
-    tx_centre = find_carrier_centre(ofdm);
+  quisk_cfTune(ofdm->tx_bpf, tx_bpf_centre_freq(ofdm) / ofdm->fs);
+
+  if (use_post_clip_tx_bpf(ofdm)) {
+    ofdm->tx_post_clip_bpf = MALLOC(sizeof(struct quisk_cfFilter));
+    assert(ofdm->tx_post_clip_bpf != NULL);
+    quisk_filt_cfInit(ofdm->tx_post_clip_bpf, ofdm->tx_bpf_proto,
+                      ofdm->tx_bpf_proto_n);
+    quisk_cfTune(ofdm->tx_post_clip_bpf, tx_bpf_centre_freq(ofdm) / ofdm->fs);
+
+    ofdm->tx_post_clip_bpf2 = MALLOC(sizeof(struct quisk_cfFilter));
+    assert(ofdm->tx_post_clip_bpf2 != NULL);
+    quisk_filt_cfInit(ofdm->tx_post_clip_bpf2, ofdm->tx_bpf_proto,
+                      ofdm->tx_bpf_proto_n);
+    quisk_cfTune(ofdm->tx_post_clip_bpf2, tx_bpf_centre_freq(ofdm) / ofdm->fs);
   }
-  quisk_cfTune(ofdm->tx_bpf, tx_centre / ofdm->fs);
 }
 
 static void deallocate_tx_bpf(struct OFDM *ofdm) {
@@ -565,6 +575,30 @@ static void deallocate_tx_bpf(struct OFDM *ofdm) {
   quisk_filt_destroy(ofdm->tx_bpf);
   FREE(ofdm->tx_bpf);
   ofdm->tx_bpf = NULL;
+  if (ofdm->tx_post_clip_bpf) {
+    quisk_filt_destroy(ofdm->tx_post_clip_bpf);
+    FREE(ofdm->tx_post_clip_bpf);
+    ofdm->tx_post_clip_bpf = NULL;
+  }
+  if (ofdm->tx_post_clip_bpf2) {
+    quisk_filt_destroy(ofdm->tx_post_clip_bpf2);
+    FREE(ofdm->tx_post_clip_bpf2);
+    ofdm->tx_post_clip_bpf2 = NULL;
+  }
+}
+
+static bool use_post_clip_tx_bpf(struct OFDM *ofdm) {
+  return !strcmp(ofdm->mode, "datac4") || !strcmp(ofdm->mode, "datac13") ||
+         !strcmp(ofdm->mode, "datac14");
+}
+
+static float tx_bpf_centre_freq(struct OFDM *ofdm) {
+  if (use_post_clip_tx_bpf(ofdm)) {
+    // Centre the filter on the mean carrier freq, allows a narrower filter to
+    // be used. Only really useful for very narrow, Nc odd waveforms.
+    return find_carrier_centre(ofdm);
+  }
+  return ofdm->tx_centre;
 }
 
 static float find_carrier_centre(struct OFDM *ofdm) {
@@ -1097,6 +1131,18 @@ void ofdm_hilbert_clipper(struct OFDM *ofdm, complex float *tx, size_t n) {
      levels to the transmitter */
 
   ofdm_clip(tx, OFDM_PEAK, n);
+
+  if (ofdm->tx_bpf_en && ofdm->tx_post_clip_bpf) {
+    complex float tx_filt[n];
+    quisk_ccfFilter(tx, tx_filt, n, ofdm->tx_post_clip_bpf);
+    if (ofdm->tx_post_clip_bpf2) {
+      complex float tx_filt2[n];
+      quisk_ccfFilter(tx_filt, tx_filt2, n, ofdm->tx_post_clip_bpf2);
+      memmove(tx, tx_filt2, n * sizeof(complex float));
+    } else {
+      memmove(tx, tx_filt, n * sizeof(complex float));
+    }
+  }
 }
 
 struct OFDM_CONFIG *ofdm_get_config_param(struct OFDM *ofdm) {
