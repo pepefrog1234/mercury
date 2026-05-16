@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <stdlib.h>
 #include "os_interop.h"
 #include <ffaudio/audio.h>
 #include "std.h"
@@ -64,6 +65,51 @@ static int str_to_guid(const char *s, GUID *g)
 }
 
 #endif /* _WIN32 */
+
+#if defined(__APPLE__)
+static int coreaudio_resolve_device_id(ffaudio_interface *audio, unsigned mode, const char *device_id, int *resolved_id)
+{
+    char *endptr = NULL;
+    long numeric_id;
+    ffaudio_dev *d;
+    int rc = -1;
+
+    if (!audio || !device_id || !device_id[0] || !resolved_id)
+        return -1;
+
+    numeric_id = strtol(device_id, &endptr, 10);
+    if (endptr && *endptr == '\0')
+    {
+        *resolved_id = (int)numeric_id;
+        return 0;
+    }
+
+    d = audio->dev_alloc(mode);
+    if (!d)
+        return -1;
+
+    for (;;)
+    {
+        int r = audio->dev_next(d);
+        if (r > 0)
+            break;
+        if (r < 0)
+            break;
+
+        const char *name = audio->dev_info(d, FFAUDIO_DEV_NAME);
+        const char *id = audio->dev_info(d, FFAUDIO_DEV_ID);
+        if (name && id && strcmp(name, device_id) == 0)
+        {
+            memcpy(resolved_id, id, sizeof(*resolved_id));
+            rc = 0;
+            break;
+        }
+    }
+
+    audio->dev_free(d);
+    return rc;
+}
+#endif /* __APPLE__ */
 
 cbuf_handle_t capture_buffer;
 cbuf_handle_t playback_buffer;
@@ -172,6 +218,7 @@ void *radio_playback_thread(void *device_ptr)
 {
     ffaudio_interface *audio;
     struct conf conf = {};
+    int coreaudio_device_id = -1;
     conf.buf.app_name = "mercury_playback";
     conf.buf.format = FFAUDIO_F_INT32;
     conf.buf.sample_rate = 48000;
@@ -268,6 +315,12 @@ void *radio_playback_thread(void *device_ptr)
     {
         did_init_play = true;
     }
+
+#if defined(__APPLE__)
+    if (audio_subsystem == AUDIO_SUBSYSTEM_COREAUDIO && conf.buf.device_id &&
+        coreaudio_resolve_device_id(audio, FFAUDIO_DEV_PLAYBACK, conf.buf.device_id, &coreaudio_device_id) == 0)
+        conf.buf.device_id = (const char *)&coreaudio_device_id;
+#endif
 
     // playback code...
     b = audio->alloc();
@@ -446,6 +499,7 @@ void *radio_capture_thread(void *device_ptr)
 {
     ffaudio_interface *audio;
     struct conf conf = {};
+    int coreaudio_device_id = -1;
     conf.buf.app_name = "mercury_capture";
     conf.buf.format = FFAUDIO_F_INT32;
     conf.buf.sample_rate = 48000;
@@ -531,6 +585,12 @@ void *radio_capture_thread(void *device_ptr)
     {
         did_init_cap = true;
     }
+
+#if defined(__APPLE__)
+    if (audio_subsystem == AUDIO_SUBSYSTEM_COREAUDIO && conf.buf.device_id &&
+        coreaudio_resolve_device_id(audio, FFAUDIO_DEV_CAPTURE, conf.buf.device_id, &coreaudio_device_id) == 0)
+        conf.buf.device_id = (const char *)&coreaudio_device_id;
+#endif
 
     // capture code
     b = audio->alloc();
@@ -935,9 +995,20 @@ void list_soundcards(int audio_system)
                     break;
                 }
 
+            const char *id = audio->dev_info(d, FFAUDIO_DEV_ID);
+#if defined(__APPLE__)
+            char id_buf[32] = {0};
+            if (audio_system == AUDIO_SUBSYSTEM_COREAUDIO && id)
+            {
+                int numeric_id = -1;
+                memcpy(&numeric_id, id, sizeof(numeric_id));
+                snprintf(id_buf, sizeof(id_buf), "%d", numeric_id);
+                id = id_buf;
+            }
+#endif
             printf("device: name: '%s'  id: '%s'  default: %s\n"
                    , audio->dev_info(d, FFAUDIO_DEV_NAME)
-                   , audio->dev_info(d, FFAUDIO_DEV_ID)
+                   , id ? id : ""
                    , audio->dev_info(d, FFAUDIO_DEV_IS_DEFAULT)
                 );
         }
