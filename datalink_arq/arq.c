@@ -286,8 +286,11 @@ int arq_reported_bandwidth_hz(void)
 
 bool arq_bandwidth_allows_mode(int mode)
 {
-    if (mode == FREEDV_MODE_DATAC1)
-        return arq_effective_bandwidth_hz() > ARQ_BANDWIDTH_NARROW_HZ;
+    /* DATAC3's nominal data-mode label is 500 Hz, but the current waveform
+     * skirts extend beyond a strict 500 Hz channel. Keep BW500 on DATAC4. */
+    if (arq_effective_bandwidth_hz() == ARQ_BANDWIDTH_NARROW_HZ &&
+        (mode == FREEDV_MODE_DATAC1 || mode == FREEDV_MODE_DATAC3))
+        return false;
 
     return true;
 }

@@ -134,6 +134,8 @@ Handshake semantics:
 - `ACCEPT` returns the negotiated session BW token, computed as `min(caller, callee)`.
 - Once `ACCEPT` is processed, both peers know the session bandwidth without adding a
   separate negotiation round trip.
+- A negotiated `BW500` session keeps ARQ payload on DATAC4. `BW2300` and
+  `BW2750` sessions may use the full DATAC4/DATAC3/DATAC1 ladder.
 
 ### CQ compact frame (ARQ_CQ, 14 bytes)
 

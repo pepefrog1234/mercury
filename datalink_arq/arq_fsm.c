@@ -265,10 +265,13 @@ static int mode_rank(int mode)
 
 static int clamp_payload_mode_to_bandwidth(int mode)
 {
-    if (!arq_bandwidth_allows_mode(mode) && mode == FREEDV_MODE_DATAC1)
+    if (arq_bandwidth_allows_mode(mode))
+        return mode;
+
+    if (arq_bandwidth_allows_mode(FREEDV_MODE_DATAC3))
         return FREEDV_MODE_DATAC3;
 
-    return mode;
+    return FREEDV_MODE_DATAC4;
 }
 
 /** Record the outcome of a TX frame.  Called once per frame when its fate is
@@ -349,11 +352,14 @@ static int select_best_mode(const arq_session_t *sess, int backlog)
             return FREEDV_MODE_DATAC1;
     }
 
-    float c3_thresh = (cur_rank >= mode_rank(FREEDV_MODE_DATAC3))
-                      ? ARQ_SNR_MIN_DATAC3_DB
-                      : ARQ_SNR_MIN_DATAC3_DB + ARQ_SNR_HYST_DB;
-    if (peer_snr >= c3_thresh && backlog >= ARQ_BACKLOG_MIN_DATAC3)
-        return FREEDV_MODE_DATAC3;
+    if (arq_bandwidth_allows_mode(FREEDV_MODE_DATAC3))
+    {
+        float c3_thresh = (cur_rank >= mode_rank(FREEDV_MODE_DATAC3))
+                          ? ARQ_SNR_MIN_DATAC3_DB
+                          : ARQ_SNR_MIN_DATAC3_DB + ARQ_SNR_HYST_DB;
+        if (peer_snr >= c3_thresh && backlog >= ARQ_BACKLOG_MIN_DATAC3)
+            return FREEDV_MODE_DATAC3;
+    }
 
     return FREEDV_MODE_DATAC4;
 }
@@ -365,6 +371,21 @@ static bool maybe_upgrade_mode(arq_session_t *sess)
     /* Stay on DATAC13 during startup window. */
     if (hermes_uptime_ms() < sess->startup_deadline_ms)
         return false;
+
+    int constrained_mode = clamp_payload_mode_to_bandwidth(sess->payload_mode);
+    if (constrained_mode != sess->payload_mode)
+    {
+        sess->mode_upgrade_count = 0;
+        sess->pending_tx_mode = constrained_mode;
+        sess->tx_retries_left = ARQ_MODE_REQ_RETRIES;
+
+        HLOGI(LOG_COMP, "Mode bandwidth clamp: %d -> %d",
+              sess->payload_mode, constrained_mode);
+
+        send_mode_negotiation(sess, ARQ_SUBTYPE_MODE_REQ, constrained_mode);
+        dflow_enter(sess, ARQ_DFLOW_MODE_REQ_TX, UINT64_MAX, ARQ_EV_TIMER_RETRY);
+        return true;
+    }
 
     /* Need at least one valid SNR reading from the peer before deciding. */
     if (sess->peer_snr_x10 == 0)

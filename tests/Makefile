@@ -30,7 +30,10 @@ PROJECT_INC = -I../common -I../modem -I../datalink_arq -I../datalink_broadcast \
               -I../data_interfaces -I../gui_interface -I../radio_io -I../audioio/ffaudio
 
 CFLAGS = $(COMMON_CFLAGS) $(UNITY_INC) $(PROJECT_INC)
-LDFLAGS = -lpthread -lrt -lm
+LDFLAGS = -lpthread -lm
+ifneq ($(shell uname -s),Darwin)
+LDFLAGS += -lrt
+endif
 
 # Shared mock stubs for ARQ tests
 ARQ_STUBS = datalink_arq/arq_test_stubs.c

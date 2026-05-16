@@ -39,9 +39,10 @@ HF radio using FreeDV OFDM waveforms with LDPC forward error correction.
 .PP
 The ARQ link implements a half-duplex stop-and-wait protocol with adaptive
 gear-shifting between FreeDV modes (DATAC4, DATAC3, DATAC1) based on
-measured channel SNR, providing per-direction mode selection and a
-reliability ladder that steps down immediately on errors and steps up
-after consecutive clean acknowledgements.
+measured channel SNR. BW500 sessions stay on DATAC4 for payload, while
+wide sessions may use the full ladder. This provides per-direction mode
+selection and a reliability ladder that steps down immediately on errors
+and steps up after consecutive clean acknowledgements.
 .PP
 Mercury exposes a VARA-compatible TNC (Terminal Node Controller) TCP
 interface, allowing existing amateur radio software such as UUCP, Winlink,
@@ -389,8 +390,9 @@ FSK_LDPC	6	Payload	22 bytes/frame
 .TE
 .PP
 In ARQ mode, DATAC13 is always used for the control channel.
-The payload channel starts at DATAC4 and upgrades through DATAC3 to
-DATAC1 as channel conditions permit.
+The payload channel starts at DATAC4. Wide sessions upgrade through
+DATAC3 to DATAC1 as channel conditions permit; BW500 sessions remain on
+DATAC4.
 The dual-decoder architecture runs control and payload decoders
 simultaneously.
 .SH DEFAULT PORTS

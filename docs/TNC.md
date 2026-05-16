@@ -99,7 +99,8 @@ BW2750\r
 **Response:** `OK\r` on success, `WRONG\r` on error.
 
 - **BW2300** — Full bandwidth.  Allows gear-shifting up to DATAC1 (510 bytes/frame).
-- **BW500** — Narrow bandwidth.  Restricts the maximum payload mode to DATAC3/DATAC4.
+- **BW500** — Strict narrow bandwidth.  Keeps payload on DATAC4; control and
+  beacon frames remain on DATAC13.
 - **BW2750** — Tactical mode token accepted for VARA compatibility. Mercury
   currently uses the same payload-mode ceiling as **BW2300**, but preserves
   `2750` as a negotiated/reporting token.
