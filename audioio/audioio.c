@@ -123,6 +123,7 @@ static pthread_t s_radio_playback;
 static char s_capture_dev[256];
 static char s_playback_dev[256];
 static int s_buffers_initialized = 0;
+static int s_buffers_are_shm = 0;
 static volatile bool audio_shutdown_ = false;  // local stop flag for audio threads
 
 struct conf {
@@ -135,6 +136,68 @@ struct conf {
     uint8_t nonblock;
     uint8_t wav;
 };
+
+#define AUDIOIO_MODEM_SAMPLE_RATE 8000
+
+static const char *audioio_format_name(unsigned format)
+{
+    switch (format)
+    {
+    case FFAUDIO_F_FLOAT32: return "float32";
+    case FFAUDIO_F_INT32:   return "int32";
+    case FFAUDIO_F_INT24_4: return "int24in32";
+    case FFAUDIO_F_INT24:   return "int24";
+    case FFAUDIO_F_INT16:   return "int16";
+    default:                return "unknown";
+    }
+}
+
+static int audioio_rate_ratio(unsigned device_sample_rate, const char *tag)
+{
+    if (device_sample_rate == 0 ||
+        device_sample_rate % AUDIOIO_MODEM_SAMPLE_RATE != 0)
+    {
+        HLOGE(tag, "Unsupported device sample rate %u Hz; modem audio is %d Hz and currently needs an integer-rate device",
+              device_sample_rate, AUDIOIO_MODEM_SAMPLE_RATE);
+        return 0;
+    }
+
+    int ratio = (int)(device_sample_rate / AUDIOIO_MODEM_SAMPLE_RATE);
+    if (ratio <= 0)
+    {
+        HLOGE(tag, "Invalid device/modem sample-rate ratio: %u/%d",
+              device_sample_rate, AUDIOIO_MODEM_SAMPLE_RATE);
+        return 0;
+    }
+
+    return ratio;
+}
+
+static bool audioio_playback_format_supported(unsigned format)
+{
+    return format == FFAUDIO_F_FLOAT32 ||
+           format == FFAUDIO_F_INT32 ||
+           format == FFAUDIO_F_INT24_4 ||
+           format == FFAUDIO_F_INT16;
+}
+
+static void audioio_store_playback_sample(uint8_t *dst, unsigned format, int32_t sample)
+{
+    switch (format)
+    {
+    case FFAUDIO_F_FLOAT32:
+        *(float *)dst = (float)((double)sample / 2147483648.0);
+        break;
+    case FFAUDIO_F_INT16:
+        *(int16_t *)dst = (int16_t)(sample >> 16);
+        break;
+    case FFAUDIO_F_INT32:
+    case FFAUDIO_F_INT24_4:
+    default:
+        *(int32_t *)dst = sample;
+        break;
+    }
+}
 
 
 static inline void ffthread_sleep(ffuint msec)
@@ -216,7 +279,7 @@ int audioio_pick_default_subsystem(void)
 
 void *radio_playback_thread(void *device_ptr)
 {
-    ffaudio_interface *audio;
+    ffaudio_interface *audio = NULL;
     struct conf conf = {};
     int coreaudio_device_id = -1;
     conf.buf.app_name = "mercury_playback";
@@ -226,7 +289,6 @@ void *radio_playback_thread(void *device_ptr)
     conf.buf.device_id = (device_ptr && ((const char *)device_ptr)[0] != '\0')
                          ? (const char *) device_ptr : NULL;
     uint32_t period_ms;
-    uint32_t period_bytes;
 
 
 #if defined(_WIN32)
@@ -255,10 +317,11 @@ void *radio_playback_thread(void *device_ptr)
         audio = (ffaudio_interface *) &ffcoreaudio;
 #endif
 
-    period_bytes = conf.buf.sample_rate * sizeof(double) * period_ms / 1000;
-
-    //printf("period_ms: %u\n", period_ms);
-    //printf("period_size: %u\n", period_bytes);
+    if (!audio)
+    {
+        HLOGE("audio-play", "Unsupported audio subsystem: %d", audio_subsystem);
+        return NULL;
+    }
 
 #if defined(_WIN32)
     /* DirectSound device IDs are GUID strings from get_soundcard_list().
@@ -280,20 +343,13 @@ void *radio_playback_thread(void *device_ptr)
     ffuint frame_size;
     ffuint msec_bytes;
 
-    // input is int32_t (8kHz samples from playback_buffer)
-    int32_t *input_buffer = (int32_t *) malloc(SIGNAL_BUFFER_SIZE * sizeof(int32_t));
-
-    // upsampled buffer (48kHz mono)
-    int32_t *buffer_upsampled = (int32_t *) malloc(SIGNAL_BUFFER_SIZE * sizeof(int32_t) * 6);
-
-    // output is int32_t stereo (48kHz)
-    int32_t *buffer_output_stereo = (int32_t *) malloc(SIGNAL_BUFFER_SIZE * sizeof(int32_t) * 2 * 6); // a big enough buffer
+    int32_t *input_buffer = NULL;
+    int32_t *buffer_upsampled = NULL;
+    uint8_t *buffer_output = NULL;
 
     ffuint total_written = 0;
     int ch_layout = STEREO;
-
-    // Resampling ratio: 8kHz -> 48kHz = 1:6
-    const int resample_ratio = 6;
+    int resample_ratio = 0;
 
     /* PulseAudio uses a single global context (gconn in pulse.c).
      * If init() returns "already initialized" it means the capture thread
@@ -342,16 +398,31 @@ void *radio_playback_thread(void *device_ptr)
 
     HLOGI("audio-play", "I/O playback (%s) %s / %dHz / %dch / %dms buffer",
           device_ptr ? (const char *)device_ptr : "default",
-          cfg->format == FFAUDIO_F_FLOAT32 ? "float32" :
-          cfg->format == FFAUDIO_F_INT32   ? "int32"   :
-          cfg->format == FFAUDIO_F_INT24_4 ? "int24in32" :
-          cfg->format == FFAUDIO_F_INT24   ? "int24"   :
-          cfg->format == FFAUDIO_F_INT16   ? "int16"   : "unknown",
+          audioio_format_name(cfg->format),
           cfg->sample_rate, cfg->channels, cfg->buffer_length_msec);
 
+    if (!audioio_playback_format_supported(cfg->format))
+    {
+        HLOGE("audio-play", "Unsupported playback format %d (%s), aborting",
+              cfg->format, audioio_format_name(cfg->format));
+        goto cleanup_play;
+    }
 
     frame_size = cfg->channels * (cfg->format & 0xff) / 8;
+    if (frame_size == 0 || cfg->channels == 0)
+    {
+        HLOGE("audio-play", "Invalid playback format/channels: format=%d channels=%d",
+              cfg->format, cfg->channels);
+        goto cleanup_play;
+    }
+
     msec_bytes = cfg->sample_rate * frame_size / 1000;
+    resample_ratio = audioio_rate_ratio(cfg->sample_rate, "audio-play");
+    if (resample_ratio == 0)
+        goto cleanup_play;
+
+    HLOGI("audio-play", "Resampler: %d Hz modem audio -> %d Hz device audio (x%d)",
+          AUDIOIO_MODEM_SAMPLE_RATE, cfg->sample_rate, resample_ratio);
 
 #if 0 // TODO: parametrize this
     if (radio_type == RADIO_SBITX)
@@ -361,8 +432,21 @@ void *radio_playback_thread(void *device_ptr)
 #endif
     ch_layout = STEREO;
     
-    // period_bytes at 8kHz (input rate) - adjust for the lower sample rate
-    uint32_t period_bytes_8k = period_bytes / resample_ratio;
+    uint32_t period_samples_8k = AUDIOIO_MODEM_SAMPLE_RATE * period_ms / 1000;
+    if (period_samples_8k == 0)
+        period_samples_8k = 1;
+    uint32_t period_bytes_8k = period_samples_8k * sizeof(int32_t);
+    size_t max_upsampled_samples = (size_t)period_samples_8k * (size_t)resample_ratio;
+    size_t output_bytes = max_upsampled_samples * frame_size;
+
+    input_buffer = (int32_t *)malloc(period_bytes_8k);
+    buffer_upsampled = (int32_t *)malloc(max_upsampled_samples * sizeof(int32_t));
+    buffer_output = (uint8_t *)malloc(output_bytes);
+    if (!input_buffer || !buffer_upsampled || !buffer_output)
+    {
+        HLOGE("audio-play", "Failed to allocate playback conversion buffers");
+        goto cleanup_play;
+    }
 
     while (!shutdown_ && !audio_shutdown_)
     {
@@ -391,7 +475,7 @@ void *radio_playback_thread(void *device_ptr)
 
         int samples_read_8k = n / sizeof(int32_t);
 
-        // Upsample from 8kHz to 48kHz using linear interpolation
+        // Upsample from modem rate to the actual device rate using linear interpolation.
         int samples_upsampled = samples_read_8k * resample_ratio;
         for (int i = 0; i < samples_read_8k; i++)
         {
@@ -401,30 +485,28 @@ void *radio_playback_thread(void *device_ptr)
             for (int j = 0; j < resample_ratio; j++)
             {
                 // Linear interpolation between current and next sample
-                buffer_upsampled[i * resample_ratio + j] = current + (next - current) * j / resample_ratio;
+                int64_t delta = (int64_t)next - (int64_t)current;
+                buffer_upsampled[i * resample_ratio + j] =
+                    (int32_t)((int64_t)current + (delta * j) / resample_ratio);
             }
         }
 
-        // Convert upsampled mono to stereo
+        // Convert upsampled mono int32 samples to the device's channel count and sample format.
+        const int sample_bytes = (cfg->format & 0xff) / 8;
         for (int i = 0; i < samples_upsampled; i++)
         {
-            int idx = i * cfg->channels;
-            if (ch_layout == LEFT)
+            uint8_t *frame = buffer_output + ((size_t)i * frame_size);
+            for (unsigned ch = 0; ch < cfg->channels; ch++)
             {
-                buffer_output_stereo[idx] = buffer_upsampled[i];
-                buffer_output_stereo[idx + 1] = 0;
-            }
-
-            if (ch_layout == RIGHT)
-            {
-                buffer_output_stereo[idx] = 0;
-                buffer_output_stereo[idx + 1] = buffer_upsampled[i];
-            }
-
-            if (ch_layout == STEREO)
-            {
-                buffer_output_stereo[idx] = buffer_upsampled[i];
-                buffer_output_stereo[idx + 1] = buffer_upsampled[i];
+                int32_t out_sample = 0;
+                if (ch_layout == STEREO ||
+                    (ch_layout == LEFT && ch == 0) ||
+                    (ch_layout == RIGHT && ch == 1))
+                {
+                    out_sample = buffer_upsampled[i];
+                }
+                audioio_store_playback_sample(frame + ((size_t)ch * sample_bytes),
+                                              cfg->format, out_sample);
             }
         }
 
@@ -434,7 +516,7 @@ void *radio_playback_thread(void *device_ptr)
         {
             if (audio_shutdown_) break;  // exit fast on restart
 
-            r = audio->write(b, ((uint8_t *)buffer_output_stereo) + total_written, n);
+            r = audio->write(b, buffer_output + total_written, n);
 
             if (r == -FFAUDIO_ESYNC) {
                 HLOGW("audio-play", "detected underrun");
@@ -483,7 +565,7 @@ finish_play:
 
     free(input_buffer);
     free(buffer_upsampled);
-    free(buffer_output_stereo);
+    free(buffer_output);
 
     HLOGI("audio-play", "radio_playback_thread exit");
 
@@ -497,7 +579,7 @@ finish_play:
 
 void *radio_capture_thread(void *device_ptr)
 {
-    ffaudio_interface *audio;
+    ffaudio_interface *audio = NULL;
     struct conf conf = {};
     int coreaudio_device_id = -1;
     conf.buf.app_name = "mercury_capture";
@@ -535,6 +617,12 @@ void *radio_capture_thread(void *device_ptr)
         audio = (ffaudio_interface *) &ffcoreaudio;
 #endif
 
+    if (!audio)
+    {
+        HLOGE("audio-cap", "Unsupported audio subsystem: %d", audio_subsystem);
+        return NULL;
+    }
+
 #if defined(_WIN32)
     /* DirectSound device IDs are GUID strings from get_soundcard_list().
      * Convert back to binary GUID for the DirectSound API. */
@@ -559,11 +647,9 @@ void *radio_capture_thread(void *device_ptr)
 
     int ch_layout = STEREO;
 
-    int32_t *buffer_output = NULL;
     int32_t *buffer_downsampled = NULL;
 
-    // Resampling ratio: 48kHz -> 8kHz = 6:1
-    const int resample_ratio = 6;
+    int resample_ratio = 0;
 
     /* PulseAudio uses a single global context (gconn in pulse.c).
      * If init() returns "already initialized" it means the playback thread
@@ -612,15 +698,24 @@ void *radio_capture_thread(void *device_ptr)
 
     HLOGI("audio-cap", "I/O capture (%s) %s / %dHz / %dch / %dms buffer",
           device_ptr ? (const char *)device_ptr : "default",
-          cfg->format == FFAUDIO_F_FLOAT32 ? "float32" :
-          cfg->format == FFAUDIO_F_INT32   ? "int32"   :
-          cfg->format == FFAUDIO_F_INT24_4 ? "int24in32" :
-          cfg->format == FFAUDIO_F_INT24   ? "int24"   :
-          cfg->format == FFAUDIO_F_INT16   ? "int16"   : "unknown",
+          audioio_format_name(cfg->format),
           cfg->sample_rate, cfg->channels, cfg->buffer_length_msec);
 
     frame_size = cfg->channels * (cfg->format & 0xff) / 8;
+    if (frame_size == 0 || cfg->channels == 0)
+    {
+        HLOGE("audio-cap", "Invalid capture format/channels: format=%d channels=%d",
+              cfg->format, cfg->channels);
+        goto cleanup_cap;
+    }
+
     msec_bytes = cfg->sample_rate * frame_size / 1000;
+    resample_ratio = audioio_rate_ratio(cfg->sample_rate, "audio-cap");
+    if (resample_ratio == 0)
+        goto cleanup_cap;
+
+    HLOGI("audio-cap", "Resampler: %d Hz device audio -> %d Hz modem audio (/%d)",
+          cfg->sample_rate, AUDIOIO_MODEM_SAMPLE_RATE, resample_ratio);
 
     bool capture_is_float = (cfg->format == FFAUDIO_F_FLOAT32);
     bool capture_is_int16 = (cfg->format == FFAUDIO_F_INT16);
@@ -630,12 +725,15 @@ void *radio_capture_thread(void *device_ptr)
         cfg->format != FFAUDIO_F_INT32 && cfg->format != FFAUDIO_F_INT24_4)
     {
         HLOGE("audio-cap", "Unsupported capture format %d, aborting", cfg->format);
-        audio->free(b);
-        return NULL;
+        goto cleanup_cap;
     }
 
-    buffer_output = (int32_t *) malloc(SIGNAL_BUFFER_SIZE * sizeof(int32_t) * 2);
     buffer_downsampled = (int32_t *) malloc(SIGNAL_BUFFER_SIZE * sizeof(int32_t));
+    if (!buffer_downsampled)
+    {
+        HLOGE("audio-cap", "Failed to allocate capture conversion buffer");
+        goto cleanup_cap;
+    }
 
 #if 0 // TODO: parametrize this
     if (radio_type == RADIO_SBITX)
@@ -645,11 +743,11 @@ void *radio_capture_thread(void *device_ptr)
 #endif
     ch_layout = capture_input_channel_layout;
 
-    static int resample_remainder = 0;  // Track fractional samples for accurate resampling
+    int resample_remainder = 0;  // Track position in the integer downsample cycle.
 
     /* --- Capture rate diagnostics (prints every ~5 seconds) --- */
     uint64_t diag_start_ms = audioio_monotonic_ms();
-    uint64_t diag_total_48k_frames = 0;   /* frames read from audio device (48kHz) */
+    uint64_t diag_total_device_frames = 0;   /* frames read from audio device */
     uint64_t diag_total_8k_samples = 0;   /* samples after downsampling (8kHz) */
     uint32_t diag_read_calls = 0;
     uint32_t diag_read_errors = 0;
@@ -672,7 +770,7 @@ void *radio_capture_thread(void *device_ptr)
         int frames_read = r / frame_size;
         int frames_to_write = frames_read;
         
-        // Downsample from 48kHz to 8kHz with decimation
+        // Downsample from the actual device rate to the modem rate with decimation.
         // resample_remainder tracks position in decimation cycle (0 to resample_ratio-1)
         // When remainder is 0, we take a sample; otherwise skip
         int downsampled_frames = 0;
@@ -705,8 +803,9 @@ void *radio_capture_thread(void *device_ptr)
                 if (capture_is_float)
                 {
                     float *fbuf = (float *)buffer;
-                    float fl = fbuf[i*2];
-                    float fr = fbuf[i*2 + 1];
+                    int base = i * capture_channels;
+                    float fl = fbuf[base];
+                    float fr = fbuf[base + (capture_channels > 1 ? 1 : 0)];
                     float fs;
                     if (ch_layout == LEFT)
                         fs = fl;
@@ -721,25 +820,29 @@ void *radio_capture_thread(void *device_ptr)
                 else if (capture_is_int16)
                 {
                     int16_t *i16buf = (int16_t *)buffer;
+                    int base = i * capture_channels;
                     if (ch_layout == LEFT)
-                        sample = (int32_t)i16buf[i*2] * 65536;
+                        sample = (int32_t)i16buf[base] * 65536;
                     else if (ch_layout == RIGHT)
-                        sample = (int32_t)i16buf[i*2 + 1] * 65536;
+                        sample = (int32_t)i16buf[base + (capture_channels > 1 ? 1 : 0)] * 65536;
                     else
-                        sample = ((int32_t)i16buf[i*2] + (int32_t)i16buf[i*2 + 1]) * 32768;
+                        sample = ((int32_t)i16buf[base] +
+                                  (int32_t)i16buf[base + (capture_channels > 1 ? 1 : 0)]) * 32768;
                 }
                 else
                 {
+                    int base = i * capture_channels;
                     if (ch_layout == LEFT)
-                        sample = buffer[i*2];
+                        sample = buffer[base];
                     else if (ch_layout == RIGHT)
-                        sample = buffer[i*2 + 1];
+                        sample = buffer[base + (capture_channels > 1 ? 1 : 0)];
                     else
-                        sample = (buffer[i*2] + buffer[i*2 + 1]) / 2;
+                        sample = (int32_t)(((int64_t)buffer[base] +
+                                            (int64_t)buffer[base + (capture_channels > 1 ? 1 : 0)]) / 2);
                 }
             }
 
-            // Take every 6th sample (when remainder == 0)
+            // Take every Nth sample (when remainder == 0)
             // Bounds check: ensure we don't overflow buffer_downsampled
             if (resample_remainder == 0 && downsampled_frames < (int)SIGNAL_BUFFER_SIZE)
             {
@@ -760,7 +863,7 @@ void *radio_capture_thread(void *device_ptr)
             }
         }
 
-        diag_total_48k_frames += frames_read;
+        diag_total_device_frames += frames_read;
         diag_total_8k_samples += downsampled_frames;
 
         /* Print diagnostics every ~5 seconds */
@@ -770,19 +873,19 @@ void *radio_capture_thread(void *device_ptr)
         {
 #ifdef DEBUG_IO
             double elapsed_sec = diag_elapsed / 1000.0;
-            double rate_48k = diag_total_48k_frames / elapsed_sec;
+            double rate_device = diag_total_device_frames / elapsed_sec;
             double rate_8k  = diag_total_8k_samples / elapsed_sec;
             size_t buf_used = size_buffer(capture_buffer);
             size_t buf_free = circular_buf_free_size(capture_buffer);
             HLOGD("audio-cap",
-                  "DIAG: %.1fs | reads=%u errs=%u | 48kHz=%.0f Hz (expect 48000) | 8kHz=%.0f Hz (expect 8000) | last_read=%d B | ringbuf used=%zu free=%zu | drops=%u",
+                  "DIAG: %.1fs | reads=%u errs=%u | device=%.0f Hz (expect %d) | modem=%.0f Hz (expect %d) | last_read=%d B | ringbuf used=%zu free=%zu | drops=%u",
                   elapsed_sec, diag_read_calls, diag_read_errors,
-                  rate_48k, rate_8k, diag_last_read_bytes,
+                  rate_device, cfg->sample_rate, rate_8k, AUDIOIO_MODEM_SAMPLE_RATE, diag_last_read_bytes,
                   buf_used, buf_free, diag_buf_full_drops);
 #endif /* DEBUG_IO */
             /* reset counters */
             diag_start_ms = diag_now;
-            diag_total_48k_frames = 0;
+            diag_total_device_frames = 0;
             diag_total_8k_samples = 0;
             diag_read_calls = 0;
             diag_read_errors = 0;
@@ -798,7 +901,6 @@ void *radio_capture_thread(void *device_ptr)
     if (r != 0)
         HLOGE("audio-cap", "ffaudio.clear: %s", audio->error(b));
 
-    free(buffer_output);
     free(buffer_downsampled);
 
 cleanup_cap:
@@ -1051,15 +1153,18 @@ int audioio_init_buffers(void)
     if (s_buffers_initialized)
         return 0;  // already created
 
-#if defined(_WIN32)
     uint8_t *buffer_cap = (uint8_t *)malloc(SIGNAL_BUFFER_SIZE);
     uint8_t *buffer_play = (uint8_t *)malloc(SIGNAL_BUFFER_SIZE);
+    if (!buffer_cap || !buffer_play)
+    {
+        free(buffer_cap);
+        free(buffer_play);
+        HLOGE("audioio", "Failed to allocate local audio buffers");
+        return -1;
+    }
     capture_buffer = circular_buf_init(buffer_cap, SIGNAL_BUFFER_SIZE);
     playback_buffer = circular_buf_init(buffer_play, SIGNAL_BUFFER_SIZE);
-#else
-    capture_buffer = circular_buf_init_shm(SIGNAL_BUFFER_SIZE, (char *) SIGNAL_INPUT);
-    playback_buffer = circular_buf_init_shm(SIGNAL_BUFFER_SIZE, (char *) SIGNAL_OUTPUT);
-#endif
+    s_buffers_are_shm = 0;
 
     clear_buffer(capture_buffer);
     clear_buffer(playback_buffer);
@@ -1072,18 +1177,25 @@ void audioio_deinit_buffers(void)
     if (!s_buffers_initialized)
         return;
 
-#if defined(_WIN32)
-    free(capture_buffer->buffer);
-    circular_buf_free(capture_buffer);
-    free(playback_buffer->buffer);
-    circular_buf_free(playback_buffer);
-#else
-    circular_buf_destroy_shm(capture_buffer, SIGNAL_BUFFER_SIZE, (char *) SIGNAL_INPUT);
-    circular_buf_free_shm(capture_buffer);
+    if (s_buffers_are_shm)
+    {
+        circular_buf_destroy_shm(capture_buffer, SIGNAL_BUFFER_SIZE, (char *) SIGNAL_INPUT);
+        circular_buf_free_shm(capture_buffer);
 
-    circular_buf_destroy_shm(playback_buffer, SIGNAL_BUFFER_SIZE, (char *) SIGNAL_OUTPUT);
-    circular_buf_free_shm(playback_buffer);
-#endif
+        circular_buf_destroy_shm(playback_buffer, SIGNAL_BUFFER_SIZE, (char *) SIGNAL_OUTPUT);
+        circular_buf_free_shm(playback_buffer);
+    }
+    else
+    {
+        free(capture_buffer->buffer);
+        circular_buf_free(capture_buffer);
+        free(playback_buffer->buffer);
+        circular_buf_free(playback_buffer);
+    }
+
+    capture_buffer = NULL;
+    playback_buffer = NULL;
+    s_buffers_are_shm = 0;
     s_buffers_initialized = 0;
 }
 
@@ -1114,8 +1226,9 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
     else
         s_playback_dev[0] = '\0';
 
-    // Create buffers if not already created
-    audioio_init_buffers();
+    // Create process-local buffers for the internal sound-card path.
+    if (audioio_init_buffers() != 0)
+        return -1;
 
     /* Pre-initialize PulseAudio once here in the main thread before spawning
      * capture/playback threads. ffpulse_init() uses a single global context

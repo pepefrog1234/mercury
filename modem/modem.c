@@ -561,19 +561,43 @@ int shutdown_modem(generic_modem_t *g_modem)
     return 0;
 }
 
+static int append_comp_real_samples(int32_t *tx_buffer,
+                                    size_t max_samples,
+                                    size_t *total_samples,
+                                    const COMP *samples,
+                                    int sample_count)
+{
+    if (!tx_buffer || !total_samples || !samples || sample_count < 0)
+        return -1;
+
+    if (*total_samples + (size_t)sample_count > max_samples)
+        return -1;
+
+    for (int i = 0; i < sample_count; i++)
+    {
+        int16_t sample = (int16_t)samples[i].real;
+        tx_buffer[(*total_samples)++] = (int32_t)sample << 16;
+    }
+
+    return 0;
+}
+
 int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_per_burst)
 {
     pthread_mutex_lock(&modem_freedv_lock);
     struct freedv *freedv = g_modem->freedv;
+    int freedv_mode = freedv_get_mode(freedv);
     size_t bytes_per_modem_frame = freedv_get_bits_per_modem_frame(freedv) / 8;
     size_t payload_bytes = bytes_per_modem_frame - 2;  /* 2 bytes reserved for CRC16 */
     size_t n_mod_out = freedv_get_n_tx_modem_samples(freedv);
+    int n_preamble_max = freedv_get_n_tx_preamble_modem_samples(freedv);
+    int n_postamble_max = freedv_get_n_tx_postamble_modem_samples(freedv);
     uint8_t frame_with_crc[bytes_per_modem_frame];
 
     /* Inter-burst silence */
     int inter_burst_delay_ms = 200;
     int samples_silence = FREEDV_FS_8000 * inter_burst_delay_ms / 1000;
-    if (freedv_get_mode(freedv) == FREEDV_MODE_FSK_LDPC)
+    if (freedv_mode == FREEDV_MODE_FSK_LDPC)
     {
         int fsk_settle_samples = freedv_get_n_nom_modem_samples(freedv);
         if (fsk_settle_samples > samples_silence)
@@ -586,24 +610,30 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
 
     /* Calculate max buffer size needed:
      * head silence + preamble + (frames * n_mod_out) + postamble + tail silence */
-    int max_preamble = freedv_get_n_tx_modem_samples(freedv) * 2;  /* conservative estimate */
-    int max_postamble = max_preamble;
-    size_t max_samples = (size_t)samples_head + max_preamble + (frames_per_burst * n_mod_out) + max_postamble + samples_silence;
+    if (n_preamble_max < 0)
+        n_preamble_max = 0;
+    if (n_postamble_max < 0)
+        n_postamble_max = 0;
+    size_t max_samples = (size_t)samples_head +
+                         (size_t)n_preamble_max +
+                         ((size_t)frames_per_burst * n_mod_out) +
+                         (size_t)n_postamble_max +
+                         (size_t)samples_silence;
 
     /* Allocate temporary buffer for all modulated audio */
     int32_t *tx_buffer = (int32_t *)malloc(max_samples * sizeof(int32_t));
-    int16_t *mod_out_short = (int16_t *)malloc(n_mod_out * sizeof(int16_t));
+    COMP *mod_out_comp = (COMP *)malloc(n_mod_out * sizeof(COMP));
 
-    if (!tx_buffer || !mod_out_short)
+    if (!tx_buffer || !mod_out_comp)
     {
         printf("ERROR: Failed to allocate TX buffer\n");
         if (tx_buffer) free(tx_buffer);
-        if (mod_out_short) free(mod_out_short);
+        if (mod_out_comp) free(mod_out_comp);
         pthread_mutex_unlock(&modem_freedv_lock);
         return -1;
     }
 
-    int total_samples = 0;
+    size_t total_samples = 0;
 
 
     /* === STEP 1: Generate all modulated audio into temp buffer === */
@@ -613,10 +643,15 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
         tx_buffer[total_samples++] = 0;
 
     /* Generate preamble */
-    int n_preamble = freedv_rawdatapreambletx(freedv, mod_out_short);
-    for (int i = 0; i < n_preamble; i++)
+    int n_preamble = freedv_rawdatapreamblecomptx(freedv, mod_out_comp);
+    if (append_comp_real_samples(tx_buffer, max_samples, &total_samples,
+                                 mod_out_comp, n_preamble) < 0)
     {
-        tx_buffer[total_samples++] = (int32_t)mod_out_short[i] << 16;
+        HLOGE("modem-tx", "TX buffer overflow while generating preamble");
+        free(tx_buffer);
+        free(mod_out_comp);
+        pthread_mutex_unlock(&modem_freedv_lock);
+        return -1;
     }
 
     /* Generate data frame(s) */
@@ -628,18 +663,28 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
         frame_with_crc[bytes_per_modem_frame - 2] = crc16 >> 8;
         frame_with_crc[bytes_per_modem_frame - 1] = crc16 & 0xff;
 
-        freedv_rawdatatx(freedv, mod_out_short, frame_with_crc);
-        for (size_t j = 0; j < n_mod_out; j++)
+        freedv_rawdatacomptx(freedv, mod_out_comp, frame_with_crc);
+        if (append_comp_real_samples(tx_buffer, max_samples, &total_samples,
+                                     mod_out_comp, (int)n_mod_out) < 0)
         {
-            tx_buffer[total_samples++] = (int32_t)mod_out_short[j] << 16;
+            HLOGE("modem-tx", "TX buffer overflow while generating data frame");
+            free(tx_buffer);
+            free(mod_out_comp);
+            pthread_mutex_unlock(&modem_freedv_lock);
+            return -1;
         }
     }
 
     /* Generate postamble */
-    int n_postamble = freedv_rawdatapostambletx(freedv, mod_out_short);
-    for (int i = 0; i < n_postamble; i++)
+    int n_postamble = freedv_rawdatapostamblecomptx(freedv, mod_out_comp);
+    if (append_comp_real_samples(tx_buffer, max_samples, &total_samples,
+                                 mod_out_comp, n_postamble) < 0)
     {
-        tx_buffer[total_samples++] = (int32_t)mod_out_short[i] << 16;
+        HLOGE("modem-tx", "TX buffer overflow while generating postamble");
+        free(tx_buffer);
+        free(mod_out_comp);
+        pthread_mutex_unlock(&modem_freedv_lock);
+        return -1;
     }
 
     /* Add silence at end */
@@ -653,8 +698,7 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
     /* === STEP 2: Key transmitter and send pre-generated audio === */
 
     ptt_on();
-    arq_modem_ptt_on(freedv_get_mode(g_modem->freedv),
-                     freedv_get_bits_per_modem_frame(g_modem->freedv) / 8);
+    arq_modem_ptt_on(freedv_mode, bytes_per_modem_frame);
     
     /* Wait for radio relay to switch (10ms for your radio) */
     usleep(10000);
@@ -672,7 +716,7 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
     arq_modem_ptt_off();
 
     free(tx_buffer);
-    free(mod_out_short);
+    free(mod_out_comp);
 
     return 0;
 }
