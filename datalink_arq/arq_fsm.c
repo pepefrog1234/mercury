@@ -1426,12 +1426,15 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
         }
         else if (ev->id == ARQ_EV_APP_DATA_READY)
         {
-            send_ctrl_frame(sess, ARQ_SUBTYPE_TURN_REQ);
-            sess->tx_retries_left = ARQ_TURN_REQ_RETRIES;
-            tm = arq_protocol_mode_timing(sess->control_mode);
-            dflow_enter(sess, ARQ_DFLOW_TURN_REQ_TX,
-                        deadline_from_s(tm ? tm->retry_interval_s : 7.0f),
-                        ARQ_EV_TIMER_RETRY);
+            /* IRS does not own the TX turn.  Keep the data queued and let
+             * TIMER_PEER_BACKLOG request the turn after the peer-hold window.
+             * If the ISS also just queued DATA, its frame will arrive first
+             * and our ACK can advertise HAS_DATA without colliding. */
+            if (sess->deadline_ms == UINT64_MAX ||
+                sess->deadline_event != ARQ_EV_TIMER_PEER_BACKLOG)
+            {
+                enter_idle_irs(sess);
+            }
         }
         else if (ev->id == ARQ_EV_RX_TURN_REQ)
         {

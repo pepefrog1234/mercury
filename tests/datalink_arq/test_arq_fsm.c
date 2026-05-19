@@ -38,6 +38,11 @@ FAKE_VALUE_FUNC(int, fake_tx_backlog);
 FAKE_VALUE_FUNC(int, fake_tx_read, uint8_t *, size_t);
 FAKE_VOID_FUNC(fake_send_buffer_status, int);
 
+static int fake_tx_backlog_value(void)
+{
+    return 10;
+}
+
 static arq_fsm_callbacks_t test_callbacks = {
     .send_tx_frame       = fake_send_tx_frame,
     .notify_connected    = fake_notify_connected,
@@ -298,6 +303,41 @@ void test_keepalive_wait_accepts_turn_request(void)
     TEST_ASSERT_EQUAL_INT(ARQ_EV_TIMER_ACK, sess.deadline_event);
 }
 
+void test_idle_irs_defers_local_data_turn_request(void)
+{
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_IDLE_IRS;
+    sess.role = ARQ_ROLE_CALLEE;
+    sess.session_id = 0x42;
+    sess.deadline_ms = 16000;
+    sess.deadline_event = ARQ_EV_TIMER_PEER_BACKLOG;
+    fake_tx_backlog_fake.custom_fake = fake_tx_backlog_value;
+
+    arq_event_t ev = make_event(ARQ_EV_APP_DATA_READY);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_IDLE_IRS, sess.dflow_state);
+    TEST_ASSERT_EQUAL_UINT64(16000, sess.deadline_ms);
+    TEST_ASSERT_EQUAL_INT(0, fake_send_tx_frame_fake.call_count);
+}
+
+void test_idle_irs_timer_requests_turn_for_queued_data(void)
+{
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_IDLE_IRS;
+    sess.role = ARQ_ROLE_CALLEE;
+    sess.session_id = 0x42;
+    sess.deadline_event = ARQ_EV_TIMER_PEER_BACKLOG;
+    fake_tx_backlog_fake.custom_fake = fake_tx_backlog_value;
+
+    arq_event_t ev = make_event(ARQ_EV_TIMER_PEER_BACKLOG);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_TURN_REQ_TX, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(ARQ_TURN_REQ_RETRIES, sess.tx_retries_left);
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -315,5 +355,7 @@ int main(void)
     RUN_TEST(test_timeout_ms_idle);
     RUN_TEST(test_keepalive_wait_accepts_peer_data);
     RUN_TEST(test_keepalive_wait_accepts_turn_request);
+    RUN_TEST(test_idle_irs_defers_local_data_turn_request);
+    RUN_TEST(test_idle_irs_timer_requests_turn_for_queued_data);
     return UNITY_END();
 }
