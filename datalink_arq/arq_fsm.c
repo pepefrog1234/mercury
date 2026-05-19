@@ -370,6 +370,13 @@ static bool maybe_upgrade_mode(arq_session_t *sess)
     if (constrained_mode != sess->payload_mode)
     {
         sess->mode_upgrade_count = 0;
+#if ARQ_DIRECT_PAYLOAD_MODE_SWITCH
+        HLOGI(LOG_COMP, "Direct bandwidth clamp: payload mode %d -> %d",
+              sess->payload_mode, constrained_mode);
+        sess->payload_mode = constrained_mode;
+        sess->pending_tx_mode = 0;
+        return false;
+#else
         sess->pending_tx_mode = constrained_mode;
         sess->tx_retries_left = ARQ_MODE_REQ_RETRIES;
 
@@ -379,6 +386,7 @@ static bool maybe_upgrade_mode(arq_session_t *sess)
         send_mode_negotiation(sess, ARQ_SUBTYPE_MODE_REQ, constrained_mode);
         dflow_enter(sess, ARQ_DFLOW_MODE_REQ_TX, UINT64_MAX, ARQ_EV_TIMER_RETRY);
         return true;
+#endif
     }
 
     /* Need at least one valid SNR reading from the peer before deciding. */
@@ -418,6 +426,15 @@ static bool maybe_upgrade_mode(arq_session_t *sess)
     }
 
     sess->mode_upgrade_count = 0;
+
+#if ARQ_DIRECT_PAYLOAD_MODE_SWITCH
+    HLOGI(LOG_COMP, "Direct payload mode switch: %d -> %d (peer_snr=%.1f dB, ladder=%d, backlog=%d)",
+          sess->payload_mode, desired_mode,
+          (float)sess->peer_snr_x10 / 10.0f, sess->speed_level, backlog);
+    sess->payload_mode = desired_mode;
+    sess->pending_tx_mode = 0;
+    return false;
+#else
     sess->pending_tx_mode = desired_mode;
     sess->tx_retries_left = ARQ_MODE_REQ_RETRIES;
 
@@ -428,6 +445,7 @@ static bool maybe_upgrade_mode(arq_session_t *sess)
     send_mode_negotiation(sess, ARQ_SUBTYPE_MODE_REQ, desired_mode);
     dflow_enter(sess, ARQ_DFLOW_MODE_REQ_TX, UINT64_MAX, ARQ_EV_TIMER_RETRY);
     return true;
+#endif
 }
 
 /** Deliver RX payload to the application only if the sequence number matches

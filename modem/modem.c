@@ -230,6 +230,19 @@ static uint32_t compute_bitrate_bps_locked(struct freedv *freedv)
     return (uint32_t)(((uint64_t)bits_per_modem_frame * modem_sample_rate + (tx_modem_samples / 2)) / tx_modem_samples);
 }
 
+static uint32_t compute_bitrate_bps_for_mode(int mode)
+{
+    uint32_t bitrate_bps = 0;
+
+    pthread_mutex_lock(&modem_freedv_lock);
+    struct freedv *freedv = pooled_freedv_for_mode_locked(mode, NULL);
+    if (freedv)
+        bitrate_bps = compute_bitrate_bps_locked(freedv);
+    pthread_mutex_unlock(&modem_freedv_lock);
+
+    return bitrate_bps;
+}
+
 static uint32_t bitrate_level_from_payload_mode(int mode)
 {
     switch (mode)
@@ -999,7 +1012,7 @@ static void process_received_frame(const uint8_t *data,
                                    size_t nbytes_out,
                                    size_t frame_bytes,
                                    bool arq_policy_ready,
-                                   int payload_mode,
+                                   int report_mode,
                                    uint32_t bitrate_bps,
                                    float snr_est)
 {
@@ -1014,7 +1027,7 @@ static void process_received_frame(const uint8_t *data,
         return;
 
     tnc_send_sn(snr_est);
-    tnc_send_bitrate(bitrate_level_from_payload_mode(payload_mode), bitrate_bps);
+    tnc_send_bitrate(bitrate_level_from_payload_mode(report_mode), bitrate_bps);
 
     frame_type = parse_frame_header((const uint8_t *)data, payload_nbytes, NULL);
 
@@ -1056,7 +1069,7 @@ static void rx_decoder_consume_chunk(rx_decoder_state_t *state,
                                      const int16_t *samples,
                                      int sample_count,
                                      bool arq_policy_ready,
-                                     int payload_mode,
+                                     int report_mode,
                                      uint32_t bitrate_bps,
                                      rx_metrics_accum_t *metrics)
 {
@@ -1145,7 +1158,7 @@ static void rx_decoder_consume_chunk(rx_decoder_state_t *state,
                                    nbytes_out,
                                    state->bytes_cap,
                                    arq_policy_ready,
-                                   payload_mode,
+                                   report_mode,
                                    bitrate_bps,
                                    snr_est);
         }
@@ -1346,7 +1359,12 @@ void *rx_thread(void *g_modem)
     int16_t *capture_i16 = NULL;
     int capture_cap = 0;
     rx_decoder_state_t control_decoder = {0};
-    rx_decoder_state_t payload_decoder = {0};
+    rx_decoder_state_t payload_decoders[3] = {{0}};
+    const int payload_scan_modes[3] = {
+        FREEDV_MODE_DATAC4,
+        FREEDV_MODE_DATAC3,
+        FREEDV_MODE_DATAC1
+    };
     int last_pref_rx_mode = -1;
     int last_pref_tx_mode = -1;
     bool was_tx = false;
@@ -1354,10 +1372,12 @@ void *rx_thread(void *g_modem)
     bool spectrum_first_log = true;
 
     /* --- RX thread rate diagnostics (prints every ~5 seconds) --- */
+#ifdef DEBUG_IO
     uint64_t rx_diag_start_ms = monotonic_ms();
     uint64_t rx_diag_total_samples = 0;
     uint32_t rx_diag_iterations = 0;
     uint64_t rx_diag_read_time_ms = 0; /* cumulative time blocked in read_buffer */
+#endif
 
     while (!shutdown_)
     {
@@ -1380,16 +1400,6 @@ void *rx_thread(void *g_modem)
             }
 
         }
-
-        uint32_t bitrate_bps = 0;
-        pthread_mutex_lock(&modem_freedv_lock);
-        struct freedv *payload_freedv = pooled_freedv_for_mode_locked(payload_mode, NULL);
-        if (payload_freedv)
-            bitrate_bps = compute_bitrate_bps_locked(payload_freedv);
-        else if (modem->freedv)
-            bitrate_bps = compute_bitrate_bps_locked(modem->freedv);
-        pthread_mutex_unlock(&modem_freedv_lock);
-
         if (arq_policy_ready && arq_snapshot.trx == TX)
         {
             // Half-duplex local TX: drain capture at low cost and skip demod work.
@@ -1419,21 +1429,59 @@ void *rx_thread(void *g_modem)
         {
             clear_buffer(capture_buffer);
             control_decoder.demod_count = 0;
-            payload_decoder.demod_count = 0;
+            for (size_t i = 0; i < 3; i++)
+                payload_decoders[i].demod_count = 0;
             was_tx = false;
         }
 
-        if (rx_decoder_bind_mode(&control_decoder, FREEDV_MODE_DATAC13) < 0 ||
-            rx_decoder_bind_mode(&payload_decoder, payload_mode) < 0)
+        if (rx_decoder_bind_mode(&control_decoder, FREEDV_MODE_DATAC13) < 0)
+        {
+            usleep(100000);
+            continue;
+        }
+
+        bool payload_bound[3] = {false, false, false};
+        int payload_bound_count = 0;
+        for (size_t i = 0; i < 3; i++)
+        {
+            int mode = payload_scan_modes[i];
+
+            /* Once connected, scan all payload modes allowed by the negotiated
+             * bandwidth. This lets local Mercury peers switch DATA mode
+             * directly without a MODE_REQ/MODE_ACK round trip. Before ARQ is
+             * connected, preserve the older single-payload-decoder behavior. */
+            if (!(arq_policy_ready && arq_snapshot.connected))
+            {
+                if (mode != payload_mode)
+                    continue;
+            }
+            else if (!arq_bandwidth_allows_mode(mode))
+            {
+                continue;
+            }
+
+            if (rx_decoder_bind_mode(&payload_decoders[i], mode) == 0)
+            {
+                payload_bound[i] = true;
+                payload_bound_count++;
+            }
+        }
+
+        if (payload_bound_count == 0)
         {
             usleep(100000);
             continue;
         }
 
         int chunk_samples = rx_decoder_target_chunk_samples(&control_decoder);
-        int payload_chunk = rx_decoder_target_chunk_samples(&payload_decoder);
-        if (payload_chunk > chunk_samples)
-            chunk_samples = payload_chunk;
+        for (size_t i = 0; i < 3; i++)
+        {
+            if (!payload_bound[i])
+                continue;
+            int payload_chunk = rx_decoder_target_chunk_samples(&payload_decoders[i]);
+            if (payload_chunk > chunk_samples)
+                chunk_samples = payload_chunk;
+        }
 
         if (capture_cap < chunk_samples)
         {
@@ -1453,16 +1501,18 @@ void *rx_thread(void *g_modem)
             capture_cap = chunk_samples;
         }
 
-        {
-            uint64_t t0 = monotonic_ms();
-            read_buffer(capture_buffer,
-                        (uint8_t *)capture_i32,
-                        sizeof(int32_t) * (size_t)chunk_samples);
-            uint64_t t1 = monotonic_ms();
-            rx_diag_read_time_ms += (t1 - t0);
-        }
+#ifdef DEBUG_IO
+        uint64_t t0 = monotonic_ms();
+#endif
+        read_buffer(capture_buffer,
+                    (uint8_t *)capture_i32,
+                    sizeof(int32_t) * (size_t)chunk_samples);
+#ifdef DEBUG_IO
+        uint64_t t1 = monotonic_ms();
+        rx_diag_read_time_ms += (t1 - t0);
         rx_diag_iterations++;
         rx_diag_total_samples += chunk_samples;
+#endif
         for (int i = 0; i < chunk_samples; i++)
         {
             capture_i16[i] = (int16_t)(capture_i32[i] >> 16);
@@ -1474,17 +1524,22 @@ void *rx_thread(void *g_modem)
                                  chunk_samples,
                                  arq_policy_ready,
                                  payload_mode,
-                                 bitrate_bps,
+                                 compute_bitrate_bps_for_mode(payload_mode),
                                  &metrics);
 
-        if (payload_decoder.freedv != control_decoder.freedv)
+        for (size_t i = 0; i < 3; i++)
         {
-            rx_decoder_consume_chunk(&payload_decoder,
+            if (!payload_bound[i] ||
+                payload_decoders[i].freedv == control_decoder.freedv)
+                continue;
+
+            int mode = payload_scan_modes[i];
+            rx_decoder_consume_chunk(&payload_decoders[i],
                                      capture_i16,
                                      chunk_samples,
                                      arq_policy_ready,
-                                     payload_mode,
-                                     bitrate_bps,
+                                     mode,
+                                     compute_bitrate_bps_for_mode(mode),
                                      &metrics);
         }
 
@@ -1543,13 +1598,13 @@ void *rx_thread(void *g_modem)
             }
         }
 
+#ifdef DEBUG_IO
         /* --- RX rate diagnostics every ~5 seconds --- */
         {
             uint64_t rx_now = monotonic_ms();
             uint64_t rx_elapsed = rx_now - rx_diag_start_ms;
             if (rx_elapsed >= 5000)
             {
-#ifdef DEBUG_IO
                 double sec = rx_elapsed / 1000.0;
                 double rx_rate = rx_diag_total_samples / sec;
                 double avg_read_ms = rx_diag_iterations ?
@@ -1559,17 +1614,18 @@ void *rx_thread(void *g_modem)
                       "DIAG: %.1fs | iters=%u | consumed=%.0f samp/s (expect 8000) | avg_read_wait=%.1f ms | ringbuf_used=%zu B | chunk=%d",
                       sec, rx_diag_iterations, rx_rate, avg_read_ms,
                       buf_used, chunk_samples);
-#endif /* DEBUG_IO */
                 rx_diag_start_ms = rx_now;
                 rx_diag_total_samples = 0;
                 rx_diag_iterations = 0;
                 rx_diag_read_time_ms = 0;
             }
         }
+#endif /* DEBUG_IO */
     }
 
     rx_decoder_dispose(&control_decoder);
-    rx_decoder_dispose(&payload_decoder);
+    for (size_t i = 0; i < 3; i++)
+        rx_decoder_dispose(&payload_decoders[i]);
     free(capture_i32);
     free(capture_i16);
 

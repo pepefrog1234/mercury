@@ -227,6 +227,8 @@ extern _Atomic float arq_callint_override_s;
 #define ARQ_IRS_INACTIVITY_S          (ARQ_PEER_PAYLOAD_HOLD_S * \
                                        ARQ_IRS_INACTIVITY_CYCLES)
 #define ARQ_MODE_SWITCH_HYST_COUNT    1     /* SNR provides stability gate; 1 = immediate */
+#define ARQ_DIRECT_PAYLOAD_MODE_SWITCH 1    /* receiver scans payload modes, so DATA can
+                                            * switch mode without MODE_REQ/MODE_ACK */
 #define ARQ_STARTUP_MAX_S             8     /* DATAC13-only startup window         */
 #define ARQ_STARTUP_ACKS_REQUIRED     1
 #define ARQ_SNR_HYST_DB               1.0f

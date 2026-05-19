@@ -391,6 +391,11 @@ once peer SNR is known. This avoids keeping interactive text traffic on DATAC4
 just because each message fits in one slow frame. `BW500` remains clamped to
 DATAC4.
 
+Current Mercury peers scan DATAC4/DATAC3/DATAC1 simultaneously while connected
+on wide links, so the ISS can switch payload mode directly before sending DATA.
+`MODE_REQ`/`MODE_ACK` is still understood for compatibility, but the local fast
+path avoids spending an extra control-frame round trip just to change speed.
+
 **Downgrade** triggers:
 - A retry event (frame not ACKed in time): drop to DATAC4.
 - Peer SNR feedback below threshold.
