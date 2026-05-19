@@ -233,7 +233,7 @@ extern _Atomic float arq_callint_override_s;
 #define ARQ_SNR_MIN_DATAC4_DB        -4.0f  /* target MPP SNR (codec2 README) */
 #define ARQ_SNR_MIN_DATAC3_DB        -1.0f
 #define ARQ_SNR_MIN_DATAC1_DB         3.0f
-#define ARQ_BACKLOG_MIN_DATAC3        56
+#define ARQ_BACKLOG_MIN_DATAC3        1     /* wide links may use DATAC3 for short chat bursts */
 #define ARQ_BACKLOG_MIN_DATAC1        126
 #define ARQ_BACKLOG_MIN_BIDIR_UPGRADE 48    /* > DATAC4 payload capacity          */
 #define ARQ_LADDER_LEVELS             3     /* 0=DATAC4, 1=DATAC3, 2=DATAC1     */

@@ -331,12 +331,6 @@ static int select_best_mode(const arq_session_t *sess, int backlog)
         return FREEDV_MODE_DATAC4;
     }
 
-    /* Don't upgrade if the backlog fits in a single frame at the current mode.
-     * MODE_REQ/MODE_ACK airtime overhead is never worthwhile for one frame. */
-    const arq_mode_timing_t *cur = arq_protocol_mode_timing(effective_mode);
-    if (cur && backlog <= cur->payload_bytes - ARQ_FRAME_HDR_SIZE)
-        return effective_mode;
-
     float peer_snr = (float)sess->peer_snr_x10 / 10.0f;
     int   cur_rank = mode_rank(effective_mode);
 
@@ -1115,11 +1109,20 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
         if (ev->id == ARQ_EV_APP_DATA_READY && g_cbs.tx_backlog &&
             g_cbs.tx_backlog() > 0)
         {
-            if (sess->need_initial_guard)
+            bool initial_guard = sess->need_initial_guard;
+            sess->need_initial_guard = false;
+
+            /* For chat-sized payloads, the previous "single DATAC4 frame fits"
+             * rule kept wide links at 87 bps indefinitely.  Check mode
+             * negotiation before consuming queued bytes so BW2300/BW2750 can
+             * move to DATAC3 once peer SNR is known. */
+            if (maybe_upgrade_mode(sess))
+                return;
+
+            if (initial_guard)
             {
                 /* First DATA after connect: apply channel guard so IRS has
                  * time to reset decoders from TX→RX before our preamble. */
-                sess->need_initial_guard = false;
                 dflow_enter(sess, ARQ_DFLOW_DATA_TX,
                             hermes_uptime_ms() + ARQ_ISS_POST_ACK_GUARD_MS,
                             ARQ_EV_TIMER_ACK);

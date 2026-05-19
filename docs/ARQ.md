@@ -383,8 +383,13 @@ Mode selection follows a `speed_level` ladder:
 
 **Upgrade** triggers (ISS side, checked after each ACK):
 - SNR > threshold + `ARQ_SNR_HYST_DB` (1.0 dB), *and*
-- backlog > `ARQ_BACKLOG_MIN_DATAC3` (56 bytes) or `ARQ_BACKLOG_MIN_DATAC1` (126 bytes).
+- backlog >= `ARQ_BACKLOG_MIN_DATAC3` (1 byte) or `ARQ_BACKLOG_MIN_DATAC1` (126 bytes).
 - A hysteresis counter (`ARQ_MODE_SWITCH_HYST_COUNT = 1`) avoids rapid flapping.
+
+For `BW2300`/`BW2750`, DATAC3 is allowed even for short chat-sized payloads
+once peer SNR is known. This avoids keeping interactive text traffic on DATAC4
+just because each message fits in one slow frame. `BW500` remains clamped to
+DATAC4.
 
 **Downgrade** triggers:
 - A retry event (frame not ACKed in time): drop to DATAC4.

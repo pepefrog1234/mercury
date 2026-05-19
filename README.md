@@ -74,7 +74,8 @@ Options:
 Mode behavior notes:
 - `-m` / `-s` affects **broadcast** and **test** modes only.
 - During an active ARQ link, control frames use DATAC13 and ARQ payload starts
-  in DATAC4. Wide links may adapt to DATAC3/DATAC1.
+  in DATAC4. Wide links may adapt to DATAC3/DATAC1, including short chat
+  payloads once peer SNR is known.
 - VARA `BW500` keeps payload on DATAC4 for a strict narrow transmit signal;
   `BW2300` and `BW2750` both allow the full Mercury payload-mode ladder.
 - `CALL` advertises the local BW token and `ACCEPT` returns the negotiated

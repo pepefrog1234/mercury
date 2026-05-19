@@ -338,6 +338,27 @@ void test_idle_irs_timer_requests_turn_for_queued_data(void)
     TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
 }
 
+void test_idle_iss_short_backlog_negotiates_datac3_on_wide_link(void)
+{
+    mock_set_uptime_ms(20000);
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_IDLE_ISS;
+    sess.role = ARQ_ROLE_CALLER;
+    sess.session_id = 0x42;
+    sess.payload_mode = FREEDV_MODE_DATAC4;
+    sess.peer_tx_mode = FREEDV_MODE_DATAC4;
+    sess.peer_snr_x10 = 180;
+    sess.startup_deadline_ms = 0;
+    fake_tx_backlog_fake.custom_fake = fake_tx_backlog_value;
+
+    arq_event_t ev = make_event(ARQ_EV_APP_DATA_READY);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_MODE_REQ_TX, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(FREEDV_MODE_DATAC3, sess.pending_tx_mode);
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -357,5 +378,6 @@ int main(void)
     RUN_TEST(test_keepalive_wait_accepts_turn_request);
     RUN_TEST(test_idle_irs_defers_local_data_turn_request);
     RUN_TEST(test_idle_irs_timer_requests_turn_for_queued_data);
+    RUN_TEST(test_idle_iss_short_backlog_negotiates_datac3_on_wide_link);
     return UNITY_END();
 }
