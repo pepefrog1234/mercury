@@ -376,35 +376,52 @@ more data.
 
 ---
 
-## Mode Upgrade / Downgrade
+## Adaptive Rate Rules
 
-Mode selection follows a `speed_level` ladder:
-`DATAC4 (0) → DATAC3 (1) → DATAC1 (2)`.
+Mode selection is deliberately conservative for HF.  A loopback cable can carry
+DATAC1 immediately, but a real shortwave path can fade, drift, or lose a single
+ACK even when the average SNR looks good.  The ARQ mode ladder therefore treats
+DATAC3 as the fast interactive default and DATAC1 as an earned high-speed mode.
 
-**Upgrade** triggers (ISS side, checked after each ACK):
-- SNR > threshold + `ARQ_SNR_HYST_DB` (1.0 dB), *and*
-- backlog >= `ARQ_BACKLOG_MIN_DATAC3` (1 byte) or `ARQ_BACKLOG_MIN_DATAC1` (126 bytes).
-- A hysteresis counter (`ARQ_MODE_SWITCH_HYST_COUNT = 1`) avoids rapid flapping.
+**Bandwidth caps**
+- `BW500` is always clamped to DATAC4.
+- `BW2300` and `BW2750` may use DATAC4, DATAC3, and DATAC1.
+- Control frames continue to use DATAC13.
 
-For `BW2300`/`BW2750`, DATAC3 is allowed even for short chat-sized payloads
-once peer SNR is known. This avoids keeping interactive text traffic on DATAC4
-just because each message fits in one slow frame. `BW500` remains clamped to
-DATAC4.
+**Startup**
+- New ARQ sessions start with DATAC4 payload mode.
+- During `ARQ_STARTUP_MAX_S` (8 s), payload mode upgrades are suppressed while
+  the link establishes stable control framing.
+- At least one peer SNR report is required before any payload upgrade decision.
 
-Current Mercury peers scan DATAC4/DATAC3/DATAC1 simultaneously while connected
-on wide links, so the ISS can switch payload mode directly before sending DATA.
-`MODE_REQ`/`MODE_ACK` is still understood for compatibility, but the local fast
-path avoids spending an extra control-frame round trip just to change speed.
+**DATAC3 upgrade**
+- Allowed on `BW2300`/`BW2750` when peer SNR is at least
+  `ARQ_SNR_MIN_DATAC3_DB + ARQ_SNR_HYST_DB`.
+- Requires backlog >= `ARQ_BACKLOG_MIN_DATAC3` (1 byte), so short chat messages
+  are not trapped on DATAC4.
+- Does not require prior clean ACK history; this keeps interactive text usable.
 
-**Downgrade** triggers:
-- A retry event (frame not ACKed in time): drop to DATAC4.
-- Peer SNR feedback below threshold.
+**DATAC1 upgrade**
+- Allowed only on `BW2300`/`BW2750`.
+- Requires peer SNR at least `ARQ_SNR_MIN_DATAC1_DB + ARQ_SNR_HYST_DB`.
+- Requires backlog >= `ARQ_BACKLOG_MIN_DATAC1` (126 bytes).
+- Requires `speed_level >= ARQ_DATAC1_MIN_STABILITY_LEVEL`.
+- `speed_level` rises only after `ARQ_LADDER_UP_SUCCESSES` (4) consecutive
+  clean ACKs, so DATAC1 is used only after the link has proven itself.
 
-Mode change procedure: ISS sends `MODE_REQ`; IRS responds with `MODE_ACK` or
-ignores (ISS falls back after `ARQ_MODE_REQ_RETRIES = 2`).
+**Downgrade and retry behavior**
+- Any DATA retry resets `speed_level` to 0, forcing DATAC1 to be re-earned.
+- `ARQ_RETRY_DOWNGRADE_THRESHOLD` (2) consecutive retries force a payload mode
+  downgrade and start `ARQ_MODE_HOLD_AFTER_DOWNGRADE_S` (15 s) before re-upgrade.
+- If peer SNR falls below the current mode threshold, the selector drops to a
+  lower payload mode even without retry history.
 
-During the **startup window** (`ARQ_STARTUP_MAX_S = 8 s`), only DATAC13 is used
-for bidirectional control framing to ensure the link is stable before upgrading.
+**Mode switching**
+- Current Mercury peers scan DATAC4/DATAC3/DATAC1 simultaneously while connected
+  on wide links, so the ISS can switch payload mode directly before sending DATA.
+- `MODE_REQ`/`MODE_ACK` is still understood for compatibility, but the local
+  fast path avoids spending an extra control-frame round trip just to change
+  speed.
 
 ---
 

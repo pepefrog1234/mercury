@@ -365,7 +365,7 @@ void test_idle_iss_short_backlog_direct_switches_to_datac3_on_wide_link(void)
     TEST_ASSERT_EQUAL_INT(0, fake_send_tx_frame_fake.call_count);
 }
 
-void test_idle_iss_large_backlog_direct_switches_to_datac1_on_wide_link(void)
+void test_idle_iss_large_backlog_uses_datac3_until_link_is_proven(void)
 {
     mock_set_uptime_ms(20000);
     sess.conn_state = ARQ_CONN_CONNECTED;
@@ -375,6 +375,28 @@ void test_idle_iss_large_backlog_direct_switches_to_datac1_on_wide_link(void)
     sess.payload_mode = FREEDV_MODE_DATAC4;
     sess.peer_tx_mode = FREEDV_MODE_DATAC4;
     sess.peer_snr_x10 = 180;
+    sess.startup_deadline_ms = 0;
+    fake_tx_backlog_fake.custom_fake = fake_tx_backlog_large_value;
+
+    arq_event_t ev = make_event(ARQ_EV_APP_DATA_READY);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_DATA_TX, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(FREEDV_MODE_DATAC3, sess.payload_mode);
+    TEST_ASSERT_EQUAL_INT(0, sess.pending_tx_mode);
+}
+
+void test_idle_iss_large_backlog_direct_switches_to_datac1_after_clean_acks(void)
+{
+    mock_set_uptime_ms(20000);
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_IDLE_ISS;
+    sess.role = ARQ_ROLE_CALLER;
+    sess.session_id = 0x42;
+    sess.payload_mode = FREEDV_MODE_DATAC3;
+    sess.peer_tx_mode = FREEDV_MODE_DATAC3;
+    sess.peer_snr_x10 = 180;
+    sess.speed_level = ARQ_DATAC1_MIN_STABILITY_LEVEL;
     sess.startup_deadline_ms = 0;
     fake_tx_backlog_fake.custom_fake = fake_tx_backlog_large_value;
 
@@ -406,6 +428,7 @@ int main(void)
     RUN_TEST(test_idle_irs_defers_local_data_turn_request);
     RUN_TEST(test_idle_irs_timer_requests_turn_for_queued_data);
     RUN_TEST(test_idle_iss_short_backlog_direct_switches_to_datac3_on_wide_link);
-    RUN_TEST(test_idle_iss_large_backlog_direct_switches_to_datac1_on_wide_link);
+    RUN_TEST(test_idle_iss_large_backlog_uses_datac3_until_link_is_proven);
+    RUN_TEST(test_idle_iss_large_backlog_direct_switches_to_datac1_after_clean_acks);
     return UNITY_END();
 }

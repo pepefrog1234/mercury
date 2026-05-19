@@ -283,11 +283,12 @@ static void record_tx_outcome(arq_session_t *sess, bool clean)
 {
     if (!clean)
     {
-        /* Any retry → step down immediately to improve reliability */
+        /* Any retry means the HF path is not proven stable anymore.  Reset the
+         * stability ladder so DATAC1 must earn its way back through clean ACKs. */
         if (sess->speed_level > 0)
         {
-            sess->speed_level--;
-            HLOGD(LOG_COMP, "Ladder step-down to %d (retry)", sess->speed_level);
+            sess->speed_level = 0;
+            HLOGD(LOG_COMP, "Ladder reset to 0 (retry)");
         }
         sess->tx_success_count = 0;
         sess->consecutive_retries++;
@@ -342,7 +343,9 @@ static int select_best_mode(const arq_session_t *sess, int backlog)
         float c1_thresh = (cur_rank >= mode_rank(FREEDV_MODE_DATAC1))
                           ? ARQ_SNR_MIN_DATAC1_DB
                           : ARQ_SNR_MIN_DATAC1_DB + ARQ_SNR_HYST_DB;
-        if (peer_snr >= c1_thresh && backlog >= ARQ_BACKLOG_MIN_DATAC1)
+        if (peer_snr >= c1_thresh &&
+            backlog >= ARQ_BACKLOG_MIN_DATAC1 &&
+            sess->speed_level >= ARQ_DATAC1_MIN_STABILITY_LEVEL)
             return FREEDV_MODE_DATAC1;
     }
 

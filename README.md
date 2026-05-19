@@ -77,7 +77,8 @@ Mode behavior notes:
   in DATAC4. Wide links may adapt to DATAC3/DATAC1, including short chat
   payloads once peer SNR is known. Connected wide-link receivers scan the
   DATAC4/DATAC3/DATAC1 payload modes in parallel, allowing local Mercury peers
-  to switch DATA speed without a separate MODE_REQ/MODE_ACK exchange.
+  to switch DATA speed without a separate MODE_REQ/MODE_ACK exchange. DATAC1
+  remains gated by clean ACK history for field stability.
 - VARA `BW500` keeps payload on DATAC4 for a strict narrow transmit signal;
   `BW2300` and `BW2750` both allow the full Mercury payload-mode ladder.
 - `CALL` advertises the local BW token and `ACCEPT` returns the negotiated
