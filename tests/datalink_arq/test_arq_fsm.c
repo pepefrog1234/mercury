@@ -19,6 +19,7 @@
 
 DEFINE_FFF_GLOBALS;
 
+#include "freedv/freedv_api.h"
 #include "arq_fsm.h"
 #include "arq_protocol.h"
 
@@ -255,6 +256,48 @@ void test_timeout_ms_idle(void)
     TEST_ASSERT_GREATER_THAN(60000, ms);
 }
 
+void test_keepalive_wait_accepts_peer_data(void)
+{
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_KEEPALIVE_WAIT;
+    sess.role = ARQ_ROLE_CALLER;
+    sess.session_id = 0x42;
+    sess.keepalive_miss_count = 3;
+    sess.rx_expected = 0;
+
+    arq_event_t ev = make_event(ARQ_EV_RX_DATA);
+    ev.session_id = sess.session_id;
+    ev.seq = 0;
+    ev.mode = FREEDV_MODE_DATAC4;
+    ev.data_bytes = 2;
+    ev.payload_len = 2;
+    ev.payload[0] = 'o';
+    ev.payload[1] = 'k';
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_DATA_RX, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(0, sess.keepalive_miss_count);
+    TEST_ASSERT_EQUAL_UINT8(1, sess.rx_expected);
+    TEST_ASSERT_EQUAL_INT(1, fake_deliver_rx_data_fake.call_count);
+}
+
+void test_keepalive_wait_accepts_turn_request(void)
+{
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_KEEPALIVE_WAIT;
+    sess.role = ARQ_ROLE_CALLER;
+    sess.session_id = 0x42;
+    sess.keepalive_miss_count = 3;
+
+    arq_event_t ev = make_event(ARQ_EV_RX_TURN_REQ);
+    ev.session_id = sess.session_id;
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_TURN_ACK_TX, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(0, sess.keepalive_miss_count);
+    TEST_ASSERT_EQUAL_INT(ARQ_EV_TIMER_ACK, sess.deadline_event);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -270,5 +313,7 @@ int main(void)
     RUN_TEST(test_call_timeout);
     RUN_TEST(test_stop_listen);
     RUN_TEST(test_timeout_ms_idle);
+    RUN_TEST(test_keepalive_wait_accepts_peer_data);
+    RUN_TEST(test_keepalive_wait_accepts_turn_request);
     return UNITY_END();
 }

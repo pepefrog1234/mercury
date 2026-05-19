@@ -1634,6 +1634,45 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
             else
                 enter_idle_iss_guarded(sess, false);
         }
+        else if (ev->id == ARQ_EV_RX_DATA)
+        {
+            update_local_snr(sess, ev);
+            update_peer_snr(sess, ev);
+            sess->peer_tx_mode = ev->mode;
+            bool new_frame = deliver_rx_checked(sess, ev);
+            if (new_frame && g_timing)
+                arq_timing_record_data_rx(g_timing, (int)ev->seq,
+                                          (int)ev->data_bytes,
+                                          sess->local_snr_x10);
+            sess->last_rx_ms = hermes_uptime_ms();
+            sess->keepalive_miss_count = 0;
+            sess->peer_has_data = new_frame
+                                  ? (ev->rx_flags & ARQ_FLAG_HAS_DATA) != 0
+                                  : true;
+            dflow_enter(sess, ARQ_DFLOW_DATA_RX,
+                        hermes_uptime_ms() + ARQ_CHANNEL_GUARD_MS,
+                        ARQ_EV_TIMER_ACK);
+        }
+        else if (ev->id == ARQ_EV_RX_TURN_REQ)
+        {
+            sess->keepalive_miss_count = 0;
+            if (g_timing) arq_timing_record_turn(g_timing, false, "turn_req");
+            dflow_enter(sess, ARQ_DFLOW_TURN_ACK_TX,
+                        hermes_uptime_ms() + ARQ_CHANNEL_GUARD_MS,
+                        ARQ_EV_TIMER_ACK);
+        }
+        else if (ev->id == ARQ_EV_RX_MODE_REQ)
+        {
+            if (arq_protocol_mode_timing(ev->mode) != NULL &&
+                ev->mode != FREEDV_MODE_DATAC13)
+            {
+                sess->keepalive_miss_count = 0;
+                sess->peer_tx_mode = ev->mode;
+                dflow_enter(sess, ARQ_DFLOW_MODE_ACK_TX,
+                            hermes_uptime_ms() + ARQ_CHANNEL_GUARD_MS,
+                            ARQ_EV_TIMER_ACK);
+            }
+        }
         else if (ev->id == ARQ_EV_RX_KEEPALIVE)
         {
             send_ctrl_frame(sess, ARQ_SUBTYPE_KEEPALIVE_ACK);
