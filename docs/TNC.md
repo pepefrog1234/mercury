@@ -341,7 +341,8 @@ These are sent on the **control port** without a preceding command.
 | `PTT OFF\r`                                 | Radio transmitter unkeyed                    |
 | `BUFFER <bytes>\r`                          | TX buffer level update (periodic)            |
 | `SN <value>\r`                              | SNR update                                   |
-| `BITRATE (<level>) <bps> BPS\r`            | Throughput update                            |
+| `BITRATE (<level>) <bps> BPS\r`            | Received-frame bitrate update                |
+| `TXBITRATE (<level>) <bps> BPS\r`          | Local payload transmit bitrate update        |
 | `IAMALIVE\r`                                | Heartbeat (sent periodically while idle)     |
 
 ### PENDING

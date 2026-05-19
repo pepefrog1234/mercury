@@ -721,6 +721,32 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
     return 0;
 }
 
+static void report_tx_bitrate_for_data_frame(generic_modem_t *g_modem,
+                                             const uint8_t *bytes_in,
+                                             int frames_per_burst)
+{
+    if (!g_modem || !bytes_in || frames_per_burst <= 0)
+        return;
+
+    int frame_type = frame_header_packet_type(bytes_in[0]);
+    if (frame_type != PACKET_TYPE_ARQ_DATA &&
+        frame_type != PACKET_TYPE_BROADCAST_DATA)
+        return;
+
+    uint32_t bitrate_bps = 0;
+    int freedv_mode = 0;
+    pthread_mutex_lock(&modem_freedv_lock);
+    if (g_modem->freedv)
+    {
+        freedv_mode = freedv_get_mode(g_modem->freedv);
+        bitrate_bps = compute_bitrate_bps_locked(g_modem->freedv);
+    }
+    pthread_mutex_unlock(&modem_freedv_lock);
+
+    if (bitrate_bps > 0)
+        tnc_send_tx_bitrate(bitrate_level_from_payload_mode(freedv_mode), bitrate_bps);
+}
+
 static int send_modulated_data_with_cq_status(generic_modem_t *g_modem,
                                               uint8_t *bytes_in,
                                               int frames_per_burst)
@@ -728,6 +754,8 @@ static int send_modulated_data_with_cq_status(generic_modem_t *g_modem,
     bool is_cq_frame = bytes_in != NULL &&
                        frames_per_burst == 1 &&
                        frame_header_packet_type(bytes_in[0]) == PACKET_TYPE_ARQ_CQ;
+
+    report_tx_bitrate_for_data_frame(g_modem, bytes_in, frames_per_burst);
 
     if (is_cq_frame)
         arq_notify_cq_tx_started();

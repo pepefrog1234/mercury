@@ -1251,6 +1251,13 @@ void tnc_send_bitrate(uint32_t speed_level, uint32_t bps)
     (void)tnc_queue_line(buffer);
 }
 
+void tnc_send_tx_bitrate(uint32_t speed_level, uint32_t bps)
+{
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "TXBITRATE (%u) %u BPS\r", speed_level, bps);
+    (void)tnc_queue_line(buffer);
+}
+
 float tnc_get_last_snr(void)
 {
     uint32_t bits = atomic_load_explicit(&last_sn_bits, memory_order_relaxed);

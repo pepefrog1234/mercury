@@ -456,6 +456,12 @@ void test_tnc_send_bitrate(void)
     TEST_ASSERT_EQUAL_STRING("BITRATE (2) 600 BPS\r", last_queued_line);
 }
 
+void test_tnc_send_tx_bitrate(void)
+{
+    tnc_send_tx_bitrate(1, 980);
+    TEST_ASSERT_EQUAL_STRING("TXBITRATE (1) 980 BPS\r", last_queued_line);
+}
+
 void test_tnc_send_connected(void)
 {
     strncpy(arq_conn.src_addr, "SRC1", CALLSIGN_MAX_SIZE);
@@ -780,6 +786,7 @@ int main(void)
     RUN_TEST(test_tnc_send_buffer);
     RUN_TEST(test_tnc_send_sn);
     RUN_TEST(test_tnc_send_bitrate);
+    RUN_TEST(test_tnc_send_tx_bitrate);
     RUN_TEST(test_tnc_send_connected);
     RUN_TEST(test_tnc_send_cqframe);
     /* Broadcast framing helper tests */
