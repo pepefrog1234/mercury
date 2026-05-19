@@ -1814,6 +1814,17 @@ void arq_fsm_dispatch(arq_session_t *sess, const arq_event_t *ev)
           arq_dflow_state_name(sess->dflow_state),
           arq_event_name(ev->id));
 
+    if (g_timing && ev->id == ARQ_EV_TX_STARTED &&
+        (sess->conn_state == ARQ_CONN_CONNECTED ||
+         sess->conn_state == ARQ_CONN_DISCONNECTING))
+    {
+        arq_timing_record_rf_tx_start(g_timing);
+    }
+    else if (g_timing && ev->id == ARQ_EV_TX_COMPLETE)
+    {
+        arq_timing_record_rf_tx_end(g_timing);
+    }
+
     /* Track last RX time from any received frame */
     switch (ev->id)
     {

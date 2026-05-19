@@ -33,8 +33,19 @@ void test_timing_init_zeros_context(void)
     TEST_ASSERT_EQUAL_UINT64(0, ctx.tx_start_ms);
     TEST_ASSERT_EQUAL_UINT64(0, ctx.tx_end_ms);
     TEST_ASSERT_EQUAL_UINT64(0, ctx.ack_rx_ms);
+    TEST_ASSERT_EQUAL_UINT64(0, ctx.rf_tx_start_ms);
     TEST_ASSERT_EQUAL_UINT32(0, ctx.rtt_ms);
+    TEST_ASSERT_EQUAL_UINT32(0, ctx.ack_delay_ms);
+    TEST_ASSERT_EQUAL_UINT32(0, ctx.last_tx_air_ms);
+    TEST_ASSERT_EQUAL_UINT32(0, ctx.last_rf_air_ms);
     TEST_ASSERT_EQUAL_UINT32(0, ctx.retry_count);
+    TEST_ASSERT_FALSE(ctx.rf_tx_active);
+    TEST_ASSERT_EQUAL_UINT64(0, ctx.session_start_ms);
+    TEST_ASSERT_EQUAL_UINT64(0, ctx.tx_air_ms);
+    TEST_ASSERT_EQUAL_UINT64(0, ctx.rf_air_ms);
+    TEST_ASSERT_EQUAL_UINT64(0, ctx.ack_wait_ms);
+    TEST_ASSERT_EQUAL_UINT64(0, ctx.ack_delay_total_ms);
+    TEST_ASSERT_EQUAL_UINT64(0, ctx.ack_count);
     TEST_ASSERT_EQUAL_UINT64(0, ctx.tx_bytes);
     TEST_ASSERT_EQUAL_UINT64(0, ctx.rx_bytes);
     TEST_ASSERT_EQUAL_UINT64(0, ctx.retries_total);
@@ -72,6 +83,23 @@ void test_record_tx_end(void)
     arq_timing_record_tx_end(&ctx, 0);
 
     TEST_ASSERT_EQUAL_UINT64(3600, ctx.tx_end_ms);
+    TEST_ASSERT_EQUAL_UINT32(2500, ctx.last_tx_air_ms);
+    TEST_ASSERT_EQUAL_UINT64(2500, ctx.tx_air_ms);
+}
+
+/* Record total local ARQ RF airtime */
+void test_record_rf_tx_airtime(void)
+{
+    mock_set_uptime_ms(2000);
+    arq_timing_record_rf_tx_start(&ctx);
+    TEST_ASSERT_TRUE(ctx.rf_tx_active);
+
+    mock_set_uptime_ms(4600);
+    arq_timing_record_rf_tx_end(&ctx);
+
+    TEST_ASSERT_FALSE(ctx.rf_tx_active);
+    TEST_ASSERT_EQUAL_UINT32(2600, ctx.last_rf_air_ms);
+    TEST_ASSERT_EQUAL_UINT64(2600, ctx.rf_air_ms);
 }
 
 /* Record ACK RX */
@@ -80,11 +108,19 @@ void test_record_ack_rx(void)
     mock_set_uptime_ms(1000);
     arq_timing_record_tx_start(&ctx, 0, 18, 100);
 
+    mock_set_uptime_ms(3000);
+    arq_timing_record_tx_end(&ctx, 0);
+
     mock_set_uptime_ms(4000);
     arq_timing_record_ack_rx(&ctx, 0, 50 /*=500ms*/, -30 /*peer_snr_x10*/);
 
     TEST_ASSERT_EQUAL_UINT64(4000, ctx.ack_rx_ms);
     TEST_ASSERT_EQUAL_INT(-30, ctx.last_snr_peer_x10);
+    TEST_ASSERT_EQUAL_UINT32(2500, ctx.rtt_ms);
+    TEST_ASSERT_EQUAL_UINT32(500, ctx.ack_delay_ms);
+    TEST_ASSERT_EQUAL_UINT64(1, ctx.ack_count);
+    TEST_ASSERT_EQUAL_UINT64(500, ctx.ack_delay_total_ms);
+    TEST_ASSERT_EQUAL_UINT64(1000, ctx.ack_wait_ms);
 }
 
 /* Record data RX */
@@ -128,6 +164,22 @@ void test_cumulative_counters(void)
     TEST_ASSERT_EQUAL_UINT64(2, ctx.frames_rx);
 }
 
+/* Connect resets and anchors the session clock */
+void test_connect_sets_session_start(void)
+{
+    ctx.tx_bytes = 99;
+    ctx.tx_air_ms = 1234;
+    ctx.rf_air_ms = 5678;
+
+    mock_set_uptime_ms(7000);
+    arq_timing_record_connect(&ctx, 12 /*DATAC3*/);
+
+    TEST_ASSERT_EQUAL_UINT64(7000, ctx.session_start_ms);
+    TEST_ASSERT_EQUAL_UINT64(0, ctx.tx_bytes);
+    TEST_ASSERT_EQUAL_UINT64(0, ctx.tx_air_ms);
+    TEST_ASSERT_EQUAL_UINT64(0, ctx.rf_air_ms);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -135,9 +187,11 @@ int main(void)
     RUN_TEST(test_record_tx_queue);
     RUN_TEST(test_record_tx_start);
     RUN_TEST(test_record_tx_end);
+    RUN_TEST(test_record_rf_tx_airtime);
     RUN_TEST(test_record_ack_rx);
     RUN_TEST(test_record_data_rx);
     RUN_TEST(test_record_retry);
     RUN_TEST(test_cumulative_counters);
+    RUN_TEST(test_connect_sets_session_start);
     return UNITY_END();
 }

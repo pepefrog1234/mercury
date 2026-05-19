@@ -450,6 +450,8 @@ and emits `[TMG]` log lines.  These allow precise OTA round-trip analysis.
 | `arq_timing_record_tx_queue`       | `tx_queue`  | Frame submitted to action queue          |
 | `arq_timing_record_tx_start`       | `tx_start`  | PTT ON (frame on air)                    |
 | `arq_timing_record_tx_end`         | `tx_end`    | PTT OFF + on-air duration                |
+| `arq_timing_record_rf_tx_start`    | `rf_tx_start`| Local ARQ PTT ON                         |
+| `arq_timing_record_rf_tx_end`      | `rf_tx_end` | Local ARQ PTT OFF + on-air duration      |
 | `arq_timing_record_ack_rx`         | `ack_rx`    | ACK received + OTA RTT + peer SNR        |
 | `arq_timing_record_data_rx`        | `data_rx`   | Data frame decoded (IRS side) + SNR      |
 | `arq_timing_record_ack_tx`         | `ack_tx`    | ACK TX started (IRS side) + local delay  |
@@ -457,6 +459,28 @@ and emits `[TMG]` log lines.  These allow precise OTA round-trip analysis.
 | `arq_timing_record_turn`           | `turn`      | Role change + reason                     |
 | `arq_timing_record_connect`        | `connect`   | Session established                      |
 | `arq_timing_record_disconnect`     | `disconnect`| Session ended + session totals           |
+
+### Duty-cycle telemetry
+
+The `disconnect` timing line includes aggregate channel-use metrics for the
+whole ARQ session:
+
+| Field             | Meaning                                                       |
+|-------------------|---------------------------------------------------------------|
+| `rf_air`          | Total local ARQ PTT-on airtime across DATA and control frames |
+| `tx_air`          | Total local DATA-frame PTT-on airtime                         |
+| `session`         | Time from ARQ connect to disconnect                           |
+| `rf_duty`         | Local transmit duty cycle: `rf_air / session`                 |
+| `data_duty`       | DATA-only transmit duty cycle: `tx_air / session`             |
+| `payload_rate`    | Confirmed application bytes divided by local DATA airtime     |
+| `avg_ack_wait`    | Average time from local PTT-off to the peer ACK being decoded |
+| `avg_ack_delay`   | Average peer-reported data-rx to ACK-tx delay                 |
+
+Use these fields before changing ARQ timing constants.  A high `rf_duty` during
+idle means keepalive policy is wasting channel time; a low `payload_rate` with a
+large `avg_ack_wait` during data transfer means the stop-and-wait DATA/ACK cycle
+is the main bottleneck and should be addressed with a block-ACK or multi-frame
+burst design rather than by blindly shrinking channel guards.
 
 ### OTA RTT computation
 

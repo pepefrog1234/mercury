@@ -29,19 +29,29 @@ typedef struct
     uint64_t ack_rx_ms;         /* when ACK for this seq was decoded           */
     uint64_t data_rx_ms;        /* when last data frame was decoded (IRS side) */
     uint64_t ack_tx_start_ms;   /* when ACK TX started (IRS side)              */
+    uint64_t rf_tx_start_ms;    /* when any local ARQ PTT went ON             */
 
     /* Derived measurements */
     uint32_t rtt_ms;            /* OTA RTT for last ACKed frame                */
     uint32_t ack_delay_ms;      /* peer-reported delay between data-rx/ack-tx  */
+    uint32_t last_tx_air_ms;    /* last measured DATA TX on-air duration       */
+    uint32_t last_rf_air_ms;    /* last measured local ARQ PTT-on duration     */
 
     /* Per-frame retry state */
     uint32_t retry_count;       /* retries for current tx_seq                  */
+    bool     rf_tx_active;      /* true between any local ARQ PTT ON/OFF       */
 
     /* SNR (integer * 10, e.g. -23 = -2.3 dB) */
     int      last_snr_local_x10;
     int      last_snr_peer_x10;
 
     /* Session cumulative counters */
+    uint64_t session_start_ms;
+    uint64_t tx_air_ms;         /* local DATA TX airtime only                  */
+    uint64_t rf_air_ms;         /* local ARQ PTT airtime, DATA + controls      */
+    uint64_t ack_wait_ms;
+    uint64_t ack_delay_total_ms;
+    uint64_t ack_count;
     uint64_t tx_bytes;
     uint64_t rx_bytes;
     uint64_t retries_total;
@@ -71,6 +81,12 @@ void arq_timing_record_tx_start(arq_timing_ctx_t *ctx, int seq, int mode,
 
 /** @brief Record PTT OFF; logs [TMG] tx_end with duration. */
 void arq_timing_record_tx_end(arq_timing_ctx_t *ctx, int seq);
+
+/** @brief Record local ARQ PTT ON for any DATA or control frame. */
+void arq_timing_record_rf_tx_start(arq_timing_ctx_t *ctx);
+
+/** @brief Record local ARQ PTT OFF for any DATA or control frame. */
+void arq_timing_record_rf_tx_end(arq_timing_ctx_t *ctx);
 
 /**
  * @brief Record ACK received; computes and logs OTA RTT.
