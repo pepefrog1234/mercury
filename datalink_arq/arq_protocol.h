@@ -221,9 +221,9 @@ extern _Atomic float arq_callint_override_s;
 #define ARQ_TURN_REQ_RETRIES          2
 #define ARQ_MODE_REQ_RETRIES          2
 #define ARQ_PEER_PAYLOAD_HOLD_S       15    /* hold peer payload mode after activity */
-#define ARQ_IRS_INACTIVITY_CYCLES     20    /* TIMER_PEER_BACKLOG cycles without
+#define ARQ_IRS_INACTIVITY_CYCLES     4     /* TIMER_PEER_BACKLOG cycles without
                                             * RX before IRS keepalive probe
-                                            * (15s * 20 = 5 minutes)          */
+                                            * (15s * 4 = 1 minute)            */
 #define ARQ_IRS_INACTIVITY_S          (ARQ_PEER_PAYLOAD_HOLD_S * \
                                        ARQ_IRS_INACTIVITY_CYCLES)
 #define ARQ_MODE_SWITCH_HYST_COUNT    1     /* SNR provides stability gate; 1 = immediate */

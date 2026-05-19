@@ -402,9 +402,9 @@ for bidirectional control framing to ensure the link is stable before upgrading.
 
 When the link is idle (no data in either direction):
 - Every `ARQ_KEEPALIVE_INTERVAL_S` (20 s), the current ISS sends a `KEEPALIVE` frame.
-- The IRS side waits `ARQ_IRS_INACTIVITY_S` (5 minutes) without received frames
-  before probing with a `KEEPALIVE`, matching Mercury Chat's five-minute
-  application idle disconnect policy.
+- The IRS side waits `ARQ_IRS_INACTIVITY_S` (1 minute) without received frames
+  before probing with a `KEEPALIVE`, so stale links are detected before the GUI
+  application idle disconnect timer fires.
 - The peer responds with `KEEPALIVE_ACK`.
 - If `ARQ_KEEPALIVE_MISS_LIMIT` (5) consecutive keepalives receive no reply,
   the session is torn down with a local DISCONNECT.
@@ -530,7 +530,7 @@ All in `arq_protocol.h`:
 #define ARQ_KEEPALIVE_MISS_LIMIT      5
 #define ARQ_STARTUP_MAX_S             8     /* DATAC13-only startup window      */
 #define ARQ_PEER_PAYLOAD_HOLD_S       15    /* hold payload mode after activity */
-#define ARQ_IRS_INACTIVITY_CYCLES     20    /* 15s * 20 = 5 minutes             */
+#define ARQ_IRS_INACTIVITY_CYCLES     4     /* 15s * 4 = 1 minute               */
 #define ARQ_SNR_HYST_DB               1.0f
 ```
 
