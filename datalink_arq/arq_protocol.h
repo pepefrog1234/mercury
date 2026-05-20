@@ -18,10 +18,10 @@
  * Protocol version (informational — not carried in wire frames)
  * ====================================================================== */
 
-#define ARQ_PROTO_VERSION  4   /* v4: framer extension field, no proto_ver field on wire */
+#define ARQ_PROTO_VERSION  5   /* v5: burst DATA frames with cumulative ACKs */
 
 /* ======================================================================
- * Frame header layout (v4, 8 bytes total)
+ * Frame header layout (v5, 8 bytes total)
  *
  * Proto_ver field removed — both sides always run the same binary.
  * ack_delay reduced to 1 byte (10ms units, max 2.55s — covers all real delays).
@@ -31,10 +31,10 @@
  *            bits [7:5] = packet_type (3 bits: PACKET_TYPE_ARQ_CONTROL=0, ARQ_DATA=1, ARQ_CALL=2)
  *            bits [4:0] = extension field (packet-type-specific)
  *  Byte 1: subtype      — arq_subtype_t
- *  Byte 2: flags        — bit7=TURN_REQ, bit6=HAS_DATA, bits[5:0]=spare
+ *  Byte 2: flags        — bit7=TURN_REQ, bit6=HAS_DATA, DATA bits below
  *  Byte 3: session_id   — random byte chosen by caller at connect time
  *  Byte 4: tx_seq       — sender's frame sequence number
- *  Byte 5: rx_ack_seq   — last sequence number received from peer
+ *  Byte 5: rx_ack_seq   — cumulative ACK: next sequence number expected from peer
  *  Byte 6: snr_raw      — local RX SNR feedback to peer; 0=unknown
  *                         encoded as uint8_t: (int)round(snr_dB) + 128, clamped 1-255
  *  Byte 7: ack_delay    — IRS→ISS: time from data_rx to ack_tx, in 10ms units; 0=unknown
@@ -99,6 +99,14 @@
                                   * count; this flag carries bit 8, allowing   *
                                   * counts up to 511 (needed for DATAC1 which  *
                                   * has 502-byte payloads).                    */
+#define ARQ_FLAG_BURST_MORE 0x10 /* bit 4: DATA frames only — more consecutive *
+                                  * frames follow before the cumulative ACK.    */
+
+/* v5 burst window.  Keep this deliberately short: it removes most per-frame
+ * ACK/turn overhead while limiting loss recovery cost on unstable HF paths. */
+#define ARQ_BURST_MAX_FRAMES            3
+#define ARQ_BURST_MAX_FRAME_BYTES    1024
+#define ARQ_BURST_NEXT_FRAME_MARGIN_MS 2500
 
 /* ======================================================================
  * Frame subtypes
@@ -365,7 +373,7 @@ int arq_protocol_build_keepalive_ack(uint8_t *buf, size_t buf_len,
  * @param buf        Output buffer (caller-provided).
  * @param buf_len    Size of buf in bytes.
  * @param session_id ARQ session identifier.
- * @param rx_ack_seq  Last seq received from current ISS (so ISS can flush pending retries).
+ * @param rx_ack_seq  Cumulative ACK: next seq expected from current ISS.
  * @param snr_raw    Local SNR encoded for wire.
  */
 int arq_protocol_build_turn_req(uint8_t *buf, size_t buf_len,
@@ -401,7 +409,7 @@ int arq_protocol_build_mode_ack(uint8_t *buf, size_t buf_len,
  * @param buf_len      Size of buf in bytes.
  * @param session_id   ARQ session identifier.
  * @param tx_seq       TX sequence number.
- * @param rx_ack_seq   Last seq received from peer (piggybacked ACK).
+ * @param rx_ack_seq   Cumulative ACK: next seq expected from peer.
  * @param flags        ARQ_FLAG_TURN_REQ | ARQ_FLAG_HAS_DATA (bitmask).
  * @param snr_raw      Local SNR encoded for wire.
  * @param payload_valid Number of valid bytes in the payload slot.

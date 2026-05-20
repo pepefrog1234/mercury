@@ -143,6 +143,80 @@ int arq_fsm_timeout_ms(const arq_session_t *sess, uint64_t now)
  * Internal helpers
  * ====================================================================== */
 
+static uint8_t seq_add(uint8_t seq, int delta)
+{
+    return (uint8_t)(seq + delta);
+}
+
+static int seq_distance(uint8_t start, uint8_t end)
+{
+    return (int)((uint8_t)(end - start));
+}
+
+static void clear_tx_burst(arq_session_t *sess)
+{
+    sess->tx_burst_start_seq = sess->tx_seq;
+    sess->tx_burst_count = 0;
+    sess->tx_burst_acked = 0;
+    sess->tx_burst_frame_size = 0;
+    sess->tx_inflight_bytes = 0;
+    memset(sess->tx_retransmit_len, 0, sizeof(sess->tx_retransmit_len));
+    memset(sess->tx_retransmit_seq, 0, sizeof(sess->tx_retransmit_seq));
+    memset(sess->tx_retransmit_payload_bytes, 0,
+           sizeof(sess->tx_retransmit_payload_bytes));
+}
+
+static int burst_limit_for_mode(const arq_session_t *sess,
+                                int backlog, size_t user_bytes)
+{
+    int mode_limit = 1;
+    int frames_needed;
+
+    if (backlog <= 0 || user_bytes == 0)
+        return 1;
+
+    /* After any retry, drop back to one-frame stop-and-wait until the link is
+     * clean again.  This keeps burst recovery conservative on fading paths. */
+    if (sess->consecutive_retries == 0 &&
+        sess->tx_retries_left == ARQ_DATA_RETRY_SLOTS)
+    {
+        if (sess->payload_mode == FREEDV_MODE_DATAC1)
+            mode_limit = 3;
+        else if (sess->payload_mode == FREEDV_MODE_DATAC3)
+            mode_limit = 2;
+    }
+
+    frames_needed = (backlog + (int)user_bytes - 1) / (int)user_bytes;
+    if (frames_needed < 1)
+        frames_needed = 1;
+    if (mode_limit > frames_needed)
+        mode_limit = frames_needed;
+    if (mode_limit > ARQ_BURST_MAX_FRAMES)
+        mode_limit = ARQ_BURST_MAX_FRAMES;
+    return mode_limit;
+}
+
+static uint64_t rx_data_ack_deadline_ms(int mode, uint8_t flags)
+{
+    uint64_t now = hermes_uptime_ms();
+
+    if ((flags & ARQ_FLAG_BURST_MORE) == 0)
+        return now + ARQ_CHANNEL_GUARD_MS;
+
+    const arq_mode_timing_t *tm = arq_protocol_mode_timing(mode);
+    uint64_t frame_ms = tm ? (uint64_t)(tm->frame_duration_s * 1000.0f + 0.5f)
+                           : 6000ULL;
+    return now + frame_ms + ARQ_BURST_NEXT_FRAME_MARGIN_MS;
+}
+
+static void refresh_tx_inflight_bytes(arq_session_t *sess)
+{
+    int total = 0;
+    for (int i = sess->tx_burst_acked; i < sess->tx_burst_count; i++)
+        total += sess->tx_retransmit_payload_bytes[i];
+    sess->tx_inflight_bytes = total;
+}
+
 static void sess_enter(arq_session_t *sess, arq_conn_state_t new_state,
                        uint64_t deadline_ms, arq_event_id_t deadline_event)
 {
@@ -167,7 +241,7 @@ static void sess_enter(arq_session_t *sess, arq_conn_state_t new_state,
     {
         sess->dflow_state       = ARQ_DFLOW_IDLE_ISS;
         sess->peer_tx_mode      = sess->initial_payload_mode;
-        sess->tx_inflight_bytes = 0;
+        clear_tx_burst(sess);
     }
 }
 
@@ -205,6 +279,28 @@ static void send_frame(int ptype, int mode, size_t len, const uint8_t *frame)
     }
 
     g_cbs.send_tx_frame(ptype, mode, len, frame);
+}
+
+static void send_frame_burst(int ptype, int mode, size_t frame_size,
+                             int frame_count, const uint8_t *frames)
+{
+    if (!g_cbs.send_tx_frame || !frames || frame_count <= 0)
+        return;
+
+    if (frame_count == 1)
+    {
+        send_frame(ptype, mode, frame_size, frames);
+        return;
+    }
+
+    size_t total = frame_size * (size_t)frame_count;
+    if (total > INT_BUFFER_SIZE)
+    {
+        HLOGE(LOG_COMP, "Burst too large: %zu bytes (%d x %zu)",
+              total, frame_count, frame_size);
+        return;
+    }
+    g_cbs.send_tx_frame(ptype, mode, total, frames);
 }
 
 static uint64_t deadline_from_s(float seconds)
@@ -568,85 +664,195 @@ static void send_data_frame(arq_session_t *sess)
         return;
     size_t user_bytes = (size_t)tm->payload_bytes - ARQ_FRAME_HDR_SIZE;
 
-    uint8_t frame[INT_BUFFER_SIZE];
-    uint8_t payload[INT_BUFFER_SIZE];
+    size_t frame_size = (size_t)tm->payload_bytes;
+    uint8_t frames[INT_BUFFER_SIZE];
 
-    /* Retransmit without consuming ring-buffer bytes.  Checked BEFORE tx_read
-     * so that retries always replay the saved frame and never corrupt the byte
-     * stream by sending fresh (out-of-order) data. */
-    if (sess->tx_retransmit_len > 0 &&
-        sess->tx_retransmit_seq == sess->tx_seq)
+    /* Retransmit the unACKed burst tail without consuming ring-buffer bytes. */
+    if (sess->tx_burst_count > 0)
     {
-        send_frame(PACKET_TYPE_ARQ_DATA, sess->payload_mode,
-                   (size_t)sess->tx_retransmit_len, sess->tx_retransmit_buf);
-        if (g_timing)
-            arq_timing_record_tx_queue(g_timing, (int)sess->tx_seq,
-                                       sess->payload_mode,
-                                       g_cbs.tx_backlog ? g_cbs.tx_backlog() : 0,
-                                       0);  /* retransmit — no new bytes consumed */
+        int start = sess->tx_burst_acked;
+        int count = sess->tx_burst_count - start;
+        if (start < 0 || count <= 0)
+            return;
+        if (sess->tx_burst_frame_size <= 0 ||
+            (size_t)sess->tx_burst_frame_size != frame_size ||
+            frame_size * (size_t)count > sizeof(frames))
+        {
+            HLOGE(LOG_COMP, "Invalid burst retransmit state (start=%d count=%d frame=%zu saved=%d)",
+                  start, count, frame_size, sess->tx_burst_frame_size);
+            return;
+        }
+        for (int i = 0; i < count; i++)
+        {
+            int src = start + i;
+            if (sess->tx_retransmit_len[src] != (int)frame_size)
+                return;
+            memcpy(frames + (frame_size * (size_t)i),
+                   sess->tx_retransmit_buf[src], frame_size);
+            if (g_timing)
+                arq_timing_record_tx_queue(g_timing,
+                                           (int)sess->tx_retransmit_seq[src],
+                                           sess->payload_mode,
+                                           g_cbs.tx_backlog ? g_cbs.tx_backlog() : 0,
+                                           0);
+        }
+        send_frame_burst(PACKET_TYPE_ARQ_DATA, sess->payload_mode,
+                         frame_size, count, frames);
         return;
     }
 
-    memset(payload, 0, user_bytes);
-    int payload_len = g_cbs.tx_read(payload, user_bytes);
-    if (payload_len <= 0)
-        return;  /* no data and no saved frame */
+    int desired = burst_limit_for_mode(sess, g_cbs.tx_backlog(), user_bytes);
+    uint8_t payloads[ARQ_BURST_MAX_FRAMES][ARQ_BURST_MAX_FRAME_BYTES];
+    int payload_lens[ARQ_BURST_MAX_FRAMES] = {0};
+    int count = 0;
 
-    /* 0 = full frame; else = exact valid byte count (receiver trims).
-     * payload_len can exceed 255 for DATAC1 (up to 502 bytes), so we
-     * cannot fit it in uint8_t directly.  Carry bit 8 of the count in
-     * ARQ_FLAG_LEN_HI (bit 5 of the flags byte); bits [7:0] go in the
-     * payload_valid (ack_delay_raw) byte.  This allows lengths up to 511. */
-    uint8_t payload_valid;
-    uint8_t data_flags = 0;
-    if ((size_t)payload_len == user_bytes)
+    if (user_bytes > ARQ_BURST_MAX_FRAME_BYTES)
     {
-        payload_valid = ARQ_DATA_LEN_FULL;
+        HLOGE(LOG_COMP, "FATAL: burst payload buffer too small (%d < %zu)",
+              ARQ_BURST_MAX_FRAME_BYTES, user_bytes);
+        return;
     }
-    else
+
+    for (int i = 0; i < desired; i++)
     {
-        payload_valid = (uint8_t)(payload_len & 0xFF);
-        if (payload_len > 0xFF)
-            data_flags = ARQ_FLAG_LEN_HI;
+        memset(payloads[i], 0, user_bytes);
+        int payload_len = g_cbs.tx_read(payloads[i], user_bytes);
+        if (payload_len <= 0)
+            break;
+        payload_lens[i] = payload_len;
+        count++;
+        if ((size_t)payload_len < user_bytes)
+            break;
     }
+
+    if (count <= 0)
+        return;
 
     uint8_t snr_raw = 0;
     if (sess->local_snr_x10 != 0)
         snr_raw = arq_protocol_encode_snr((float)sess->local_snr_x10 / 10.0f);
 
-    int n = arq_protocol_build_data(frame, sizeof(frame),
-                                    sess->session_id, sess->tx_seq,
-                                    sess->rx_expected, data_flags, snr_raw,
-                                    payload_valid,
-                                    payload, user_bytes);
-    if (n <= 0)
+    sess->tx_burst_start_seq = sess->tx_seq;
+    sess->tx_burst_count = count;
+    sess->tx_burst_acked = 0;
+    sess->tx_burst_frame_size = (int)frame_size;
+    sess->tx_inflight_bytes = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        int payload_len = payload_lens[i];
+        uint8_t payload_valid;
+        uint8_t data_flags = (i < count - 1) ? ARQ_FLAG_BURST_MORE : 0;
+
+        /* 0 = full frame; else = exact valid byte count (receiver trims).
+         * payload_len can exceed 255 for DATAC1 (up to 502 bytes), so bit 8
+         * rides in ARQ_FLAG_LEN_HI while bits [7:0] use payload_valid. */
+        if ((size_t)payload_len == user_bytes)
+        {
+            payload_valid = ARQ_DATA_LEN_FULL;
+        }
+        else
+        {
+            payload_valid = (uint8_t)(payload_len & 0xFF);
+            if (payload_len > 0xFF)
+                data_flags |= ARQ_FLAG_LEN_HI;
+        }
+
+        uint8_t seq = seq_add(sess->tx_burst_start_seq, i);
+        int n = arq_protocol_build_data(frames + (frame_size * (size_t)i),
+                                        sizeof(frames) - (frame_size * (size_t)i),
+                                        sess->session_id, seq,
+                                        sess->rx_expected, data_flags, snr_raw,
+                                        payload_valid,
+                                        payloads[i], user_bytes);
+        if (n <= 0 || (size_t)n != frame_size)
+        {
+            clear_tx_burst(sess);
+            return;
+        }
+
+        memcpy(sess->tx_retransmit_buf[i],
+               frames + (frame_size * (size_t)i), frame_size);
+        sess->tx_retransmit_len[i] = n;
+        sess->tx_retransmit_seq[i] = seq;
+        sess->tx_retransmit_payload_bytes[i] = payload_len;
+        sess->tx_inflight_bytes += payload_len;
+
+        if (g_timing)
+            arq_timing_record_tx_queue(g_timing, (int)seq,
+                                       sess->payload_mode,
+                                       g_cbs.tx_backlog(),
+                                       payload_len);
+    }
+
+    send_frame_burst(PACKET_TYPE_ARQ_DATA, sess->payload_mode,
+                     frame_size, count, frames);
+}
+
+static int acked_frames_in_burst(const arq_session_t *sess, uint8_t ack_seq)
+{
+    if (sess->tx_burst_count <= 0)
+        return 0;
+    int acked = seq_distance(sess->tx_burst_start_seq, ack_seq);
+    if (acked < 0 || acked > sess->tx_burst_count)
+        return 0;
+    return acked;
+}
+
+static void record_burst_outcome(arq_session_t *sess, bool clean, int frames)
+{
+    if (frames < 1)
+        frames = 1;
+    if (!clean)
+    {
+        record_tx_outcome(sess, false);
         return;
-
-    sess->tx_inflight_bytes = payload_len;
-
-    /* Save for potential retransmission if ACK is lost. */
-    if ((size_t)n <= sizeof(sess->tx_retransmit_buf))
-    {
-        memcpy(sess->tx_retransmit_buf, frame, (size_t)n);
-        sess->tx_retransmit_len = n;
-        sess->tx_retransmit_seq = sess->tx_seq;
     }
-    else
+    for (int i = 0; i < frames; i++)
+        record_tx_outcome(sess, true);
+}
+
+static void complete_tx_burst(arq_session_t *sess, bool clean)
+{
+    int count = sess->tx_burst_count > 0 ? sess->tx_burst_count : 1;
+    uint8_t next = sess->tx_burst_count > 0
+                   ? seq_add(sess->tx_burst_start_seq, sess->tx_burst_count)
+                   : seq_add(sess->tx_seq, 1);
+    record_burst_outcome(sess, clean, count);
+    sess->tx_seq = next;
+    clear_tx_burst(sess);
+    sess->tx_retries_left = ARQ_DATA_RETRY_SLOTS;
+    if (g_cbs.send_buffer_status)
+        g_cbs.send_buffer_status(g_cbs.tx_backlog ? g_cbs.tx_backlog() : 0);
+}
+
+static bool retransmit_burst_tail_or_disconnect(arq_session_t *sess,
+                                                const char *reason)
+{
+    const arq_mode_timing_t *tm;
+
+    if (sess->tx_retries_left > 0)
     {
-        /* Frame too large for retransmit buffer — retries would consume fresh
-         * ring bytes and corrupt the stream.  This must not happen; it means
-         * tx_retransmit_buf needs to be enlarged. */
-        HLOGE(LOG_COMP, "FATAL: retransmit buf too small (%zu < %d) for seq=%d mode=%d",
-              sizeof(sess->tx_retransmit_buf), n,
-              (int)sess->tx_seq, sess->payload_mode);
+        sess->tx_retries_left--;
+        if (g_timing)
+            arq_timing_record_retry(g_timing, (int)sess->tx_seq,
+                                    ARQ_DATA_RETRY_SLOTS - sess->tx_retries_left,
+                                    reason ? reason : "ack_timeout");
+        refresh_tx_inflight_bytes(sess);
+        dflow_enter(sess, ARQ_DFLOW_DATA_TX, UINT64_MAX, ARQ_EV_TIMER_RETRY);
+        send_data_frame(sess);
+        return true;
     }
 
-    send_frame(PACKET_TYPE_ARQ_DATA, sess->payload_mode, (size_t)n, frame);
-    if (g_timing)
-        arq_timing_record_tx_queue(g_timing, (int)sess->tx_seq,
-                                   sess->payload_mode,
-                                   g_cbs.tx_backlog(),
-                                   payload_len);  /* new data bytes consumed */
+    HLOGW(LOG_COMP, "Data retry exhausted seq=%d — disconnecting",
+          (int)sess->tx_seq);
+    send_ctrl_frame(sess, ARQ_SUBTYPE_DISCONNECT);
+    sess->tx_retries_left = ARQ_DISCONNECT_RETRY_SLOTS;
+    tm = arq_protocol_mode_timing(sess->control_mode);
+    sess_enter(sess, ARQ_CONN_DISCONNECTING,
+               deadline_from_s(tm ? tm->retry_interval_s : 7.0f),
+               ARQ_EV_TIMER_RETRY);
+    return false;
 }
 
 /* ======================================================================
@@ -835,8 +1041,7 @@ static void fsm_listening(arq_session_t *sess, const arq_event_t *ev)
             sess->role        = ARQ_ROLE_CALLEE;
             sess->tx_seq      = 0;
             sess->rx_expected = 0;
-            sess->tx_retransmit_len = 0;
-            sess->tx_inflight_bytes = 0;
+            clear_tx_burst(sess);
             sess->tx_retries_left = ARQ_DATA_RETRY_SLOTS;
             sess->payload_mode       = FREEDV_MODE_DATAC4;
             sess->peer_tx_mode       = FREEDV_MODE_DATAC4;
@@ -873,8 +1078,7 @@ static void fsm_calling(arq_session_t *sess, const arq_event_t *ev)
             sess->role        = ARQ_ROLE_CALLER;
             sess->tx_seq      = 0;
             sess->rx_expected = 0;
-            sess->tx_retransmit_len = 0;  /* discard any stale retransmit buf from prior session */
-            sess->tx_inflight_bytes = 0;
+            clear_tx_burst(sess);  /* discard any stale retransmit burst from prior session */
             sess->tx_retries_left = ARQ_DATA_RETRY_SLOTS;
             sess->payload_mode       = FREEDV_MODE_DATAC4;   /* reset mode state from prior session */
             sess->peer_tx_mode       = FREEDV_MODE_DATAC4;
@@ -940,8 +1144,7 @@ static void fsm_accepting(arq_session_t *sess, const arq_event_t *ev)
         sess->role        = ARQ_ROLE_CALLEE;
         sess->tx_seq      = 0;
         sess->rx_expected = 0;
-        sess->tx_retransmit_len = 0;  /* discard any stale retransmit buf from prior session */
-        sess->tx_inflight_bytes = 0;
+        clear_tx_burst(sess);  /* discard any stale retransmit burst from prior session */
         sess->tx_retries_left = ARQ_DATA_RETRY_SLOTS;
         sess->payload_mode       = FREEDV_MODE_DATAC4;   /* reset mode state from prior session */
         sess->peer_tx_mode       = FREEDV_MODE_DATAC4;
@@ -1196,7 +1399,7 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
                                   ? (ev->rx_flags & ARQ_FLAG_HAS_DATA) != 0
                                   : true;
             dflow_enter(sess, ARQ_DFLOW_DATA_RX,
-                        hermes_uptime_ms() + ARQ_CHANNEL_GUARD_MS,
+                        rx_data_ack_deadline_ms(ev->mode, ev->rx_flags),
                         ARQ_EV_TIMER_ACK);
         }
         else if (ev->id == ARQ_EV_RX_TURN_REQ)
@@ -1256,18 +1459,31 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
         {
             /* peer_snr_x10 = IRS's local SNR = quality of IRS receiving our data */
             update_peer_snr(sess, ev);
-            record_tx_outcome(sess, sess->tx_retries_left == ARQ_DATA_RETRY_SLOTS);
+            int acked = acked_frames_in_burst(sess, ev->ack_seq);
             if (g_timing)
-                arq_timing_record_ack_rx(g_timing, (int)sess->tx_seq,
+                arq_timing_record_ack_rx(g_timing,
+                                         (int)seq_add(ev->ack_seq, -1),
                                          (uint8_t)ev->ack_delay_raw,
                                          sess->peer_snr_x10);
-            sess->tx_seq++;
-            sess->tx_retransmit_len = 0;  /* ACKed — discard retransmit buffer */
-            sess->tx_inflight_bytes = 0;  /* payload confirmed by peer */
-            sess->tx_retries_left   = ARQ_DATA_RETRY_SLOTS;  /* fresh counter for next seq */
+
+            if (acked < sess->tx_burst_count)
+            {
+                if (acked > sess->tx_burst_acked)
+                {
+                    sess->tx_burst_acked = acked;
+                    sess->tx_seq = ev->ack_seq;
+                    refresh_tx_inflight_bytes(sess);
+                }
+                HLOGD(LOG_COMP,
+                      "Partial cumulative ACK: %d/%d frames acked, retransmitting seq=%d",
+                      sess->tx_burst_acked, sess->tx_burst_count,
+                      (int)sess->tx_seq);
+                retransmit_burst_tail_or_disconnect(sess, "partial_ack");
+                break;
+            }
+
+            complete_tx_burst(sess, sess->tx_retries_left == ARQ_DATA_RETRY_SLOTS);
             sess->peer_has_data = (ev->rx_flags & ARQ_FLAG_HAS_DATA) != 0;
-            if (g_cbs.send_buffer_status)
-                g_cbs.send_buffer_status(g_cbs.tx_backlog ? g_cbs.tx_backlog() : 0);
 
             if (sess->peer_has_data)
             {
@@ -1296,31 +1512,7 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
                            ARQ_EV_TIMER_ACK);
                 return;
             }
-            if (sess->tx_retries_left > 0)
-            {
-                sess->tx_retries_left--;
-                /* Ladder step-down happens once per frame in the RX_ACK /
-                 * implicit-ACK handler via record_tx_outcome(), NOT here.
-                 * Calling it on every retry would cause double/triple penalty
-                 * when the ACK handler also calls it. */
-                if (g_timing)
-                    arq_timing_record_retry(g_timing, (int)sess->tx_seq,
-                                            ARQ_DATA_RETRY_SLOTS - sess->tx_retries_left,
-                                            "ack_timeout");
-                dflow_enter(sess, ARQ_DFLOW_DATA_TX, UINT64_MAX, ARQ_EV_TIMER_RETRY);
-                send_data_frame(sess);
-            }
-            else
-            {
-                HLOGW(LOG_COMP, "Data retry exhausted seq=%d — disconnecting",
-                      (int)sess->tx_seq);
-                send_ctrl_frame(sess, ARQ_SUBTYPE_DISCONNECT);
-                sess->tx_retries_left = ARQ_DISCONNECT_RETRY_SLOTS;
-                tm = arq_protocol_mode_timing(sess->control_mode);
-                sess_enter(sess, ARQ_CONN_DISCONNECTING,
-                           deadline_from_s(tm ? tm->retry_interval_s : 7.0f),
-                           ARQ_EV_TIMER_RETRY);
-            }
+            retransmit_burst_tail_or_disconnect(sess, "ack_timeout");
         }
         else if (ev->id == ARQ_EV_RX_DATA)
         {
@@ -1337,20 +1529,14 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
                 HLOGD(LOG_COMP,
                       "RX_DATA in WAIT_ACK (new seq=%d) — implicit ACK for tx_seq=%d",
                       (int)ev->seq, (int)sess->tx_seq);
-                record_tx_outcome(sess, sess->tx_retries_left == ARQ_DATA_RETRY_SLOTS);
-                sess->tx_seq++;
-                sess->tx_retransmit_len = 0;
-                sess->tx_inflight_bytes = 0;
-                sess->tx_retries_left   = ARQ_DATA_RETRY_SLOTS;
+                complete_tx_burst(sess, sess->tx_retries_left == ARQ_DATA_RETRY_SLOTS);
                 sess->peer_has_data = (ev->rx_flags & ARQ_FLAG_HAS_DATA) != 0;
-                if (g_cbs.send_buffer_status)
-                    g_cbs.send_buffer_status(g_cbs.tx_backlog ? g_cbs.tx_backlog() : 0);
                 if (deliver_rx_checked(sess, ev) && g_timing)
                     arq_timing_record_data_rx(g_timing, (int)ev->seq,
                                               (int)ev->data_bytes,
                                               sess->local_snr_x10);
                 dflow_enter(sess, ARQ_DFLOW_DATA_RX,
-                            hermes_uptime_ms() + ARQ_CHANNEL_GUARD_MS,
+                            rx_data_ack_deadline_ms(ev->mode, ev->rx_flags),
                             ARQ_EV_TIMER_ACK);
             }
             else
@@ -1385,13 +1571,7 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
                 HLOGI(LOG_COMP,
                       "MODE_REQ in WAIT_ACK (implicit ACK) tx_seq=%d peer_tx_mode %d->%d (my TX %d unchanged)",
                       (int)sess->tx_seq, sess->peer_tx_mode, ev->mode, sess->payload_mode);
-                record_tx_outcome(sess, sess->tx_retries_left == ARQ_DATA_RETRY_SLOTS);
-                sess->tx_seq++;
-                sess->tx_retransmit_len = 0;
-                sess->tx_inflight_bytes = 0;
-                sess->tx_retries_left   = ARQ_DATA_RETRY_SLOTS;
-                if (g_cbs.send_buffer_status)
-                    g_cbs.send_buffer_status(g_cbs.tx_backlog ? g_cbs.tx_backlog() : 0);
+                complete_tx_burst(sess, sess->tx_retries_left == ARQ_DATA_RETRY_SLOTS);
                 sess->peer_tx_mode = ev->mode;  /* update RX decoder; our TX mode unchanged */
                 /* Guard: allow ARQ_CHANNEL_GUARD_MS for the ISS to drop PTT
                  * before our MODE_ACK preamble arrives (same guard used by
@@ -1430,7 +1610,7 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
              * back to RX before our ACK preamble arrives.  ACK is sent
              * when TIMER_ACK fires in DATA_RX. */
             dflow_enter(sess, ARQ_DFLOW_DATA_RX,
-                        hermes_uptime_ms() + ARQ_CHANNEL_GUARD_MS,
+                        rx_data_ack_deadline_ms(ev->mode, ev->rx_flags),
                         ARQ_EV_TIMER_ACK);
         }
         else if (ev->id == ARQ_EV_TIMER_PEER_BACKLOG)
@@ -1551,6 +1731,9 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
             sess->peer_has_data = new_frame
                                   ? (ev->rx_flags & ARQ_FLAG_HAS_DATA) != 0
                                   : true;
+            dflow_enter(sess, ARQ_DFLOW_DATA_RX,
+                        rx_data_ack_deadline_ms(ev->mode, ev->rx_flags),
+                        ARQ_EV_TIMER_ACK);
         }
         break;
 
@@ -1644,7 +1827,7 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
                                   ? (ev->rx_flags & ARQ_FLAG_HAS_DATA) != 0
                                   : true;
             dflow_enter(sess, ARQ_DFLOW_DATA_RX,
-                        hermes_uptime_ms() + ARQ_CHANNEL_GUARD_MS,
+                        rx_data_ack_deadline_ms(ev->mode, ev->rx_flags),
                         ARQ_EV_TIMER_ACK);
         }
         else if (ev->id == ARQ_EV_TIMER_RETRY)
@@ -1707,7 +1890,7 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
                                   ? (ev->rx_flags & ARQ_FLAG_HAS_DATA) != 0
                                   : true;
             dflow_enter(sess, ARQ_DFLOW_DATA_RX,
-                        hermes_uptime_ms() + ARQ_CHANNEL_GUARD_MS,
+                        rx_data_ack_deadline_ms(ev->mode, ev->rx_flags),
                         ARQ_EV_TIMER_ACK);
         }
         else if (ev->id == ARQ_EV_RX_TURN_REQ)

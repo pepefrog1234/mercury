@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include "arq.h"  /* CALLSIGN_MAX_SIZE, arq_action_t/type, arq_info */
+#include "arq_protocol.h"  /* ARQ_BURST_* */
 #include "arq_timing.h"  /* arq_timing_ctx_t */
 
 /* ======================================================================
@@ -218,15 +219,18 @@ typedef struct
                                         * when stale SNR says "upgrade" but the
                                         * channel can't support it)            */
 
-    /* --- Retransmit buffer --- */
-    uint8_t  tx_retransmit_buf[1024];  /* last-sent data frame bytes; must be
-                                       * >= max frame: 8 hdr + 502 DATAC1
-                                       * payload = 510 bytes (was 256, too
-                                       * small → DATAC1 retries consumed fresh
-                                       * ring bytes, corrupting byte stream)  */
-    int      tx_retransmit_len;       /* 0 = no saved frame                   */
-    uint8_t  tx_retransmit_seq;       /* tx_seq the saved frame belongs to    */
-    int      tx_inflight_bytes;      /* payload bytes in unACKed frame       */
+    /* --- Burst/retransmit buffer ---
+     * v5 transmits a short run of DATA frames under one PTT and waits for one
+     * cumulative ACK carrying the peer's next expected sequence number. */
+    uint8_t  tx_burst_start_seq;      /* first seq in current burst            */
+    int      tx_burst_count;          /* frames in current burst               */
+    int      tx_burst_acked;          /* leading frames cumulatively ACKed      */
+    int      tx_burst_frame_size;     /* modem slot bytes for saved frames      */
+    uint8_t  tx_retransmit_buf[ARQ_BURST_MAX_FRAMES][ARQ_BURST_MAX_FRAME_BYTES];
+    int      tx_retransmit_len[ARQ_BURST_MAX_FRAMES];
+    uint8_t  tx_retransmit_seq[ARQ_BURST_MAX_FRAMES];
+    int      tx_retransmit_payload_bytes[ARQ_BURST_MAX_FRAMES];
+    int      tx_inflight_bytes;       /* payload bytes in unACKed burst tail    */
 
     /* --- Keepalive tracking --- */
     int      keepalive_miss_count;

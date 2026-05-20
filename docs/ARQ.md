@@ -10,7 +10,7 @@ a table-driven, two-level hierarchical FSM and a clean protocol codec.
 
 1. [Overview](#overview)
 2. [Module Map](#module-map)
-3. [Wire Protocol v4](#wire-protocol-v4)
+3. [Wire Protocol v5](#wire-protocol-v5)
 4. [Frame Types and Subtypes](#frame-types-and-subtypes)
 5. [Mode Timing Table](#mode-timing-table)
 6. [Two-Level FSM](#two-level-fsm)
@@ -39,6 +39,9 @@ Key properties:
   KEEPALIVE, MODE_REQ/ACK frames are always 14 bytes on DATAC13.
 - **Data frames** start in DATAC4 (54 bytes payload) and may upgrade to DATAC3 (126 bytes)
   or DATAC1 (510 bytes) based on SNR and backlog.
+- **v5 burst DATA** sends short consecutive DATA runs under one PTT and confirms them
+  with one cumulative ACK. DATAC4 remains single-frame; DATAC3 may send 2 frames;
+  DATAC1 may send 3 frames.
 - **VARA-compatible TCP TNC** interface: control on `base_port` (default 8300), data on
   `base_port+1` (8301). This interface is frozen and not modified by the ARQ rewrite.
 - **Broadcast** runs in parallel on a separate TCP port (default 8100) and is
@@ -65,7 +68,7 @@ datalink_arq/
 
 ---
 
-## Wire Protocol v4
+## Wire Protocol v5
 
 All ARQ frames begin with a **framer byte** managed by `modem/framer.c`:
 
@@ -91,10 +94,10 @@ Packet type values:
 ```
 Byte 0: framer byte  (packet_type | extension_field)
 Byte 1: subtype      (arq_subtype_t)
-Byte 2: flags        bit7=TURN_REQ  bit6=HAS_DATA
+Byte 2: flags        bit7=TURN_REQ  bit6=HAS_DATA  bit5=LEN_HI  bit4=BURST_MORE
 Byte 3: session_id   random byte chosen by caller at connect time
 Byte 4: tx_seq       sender's frame sequence number
-Byte 5: rx_ack_seq   last sequence number received from peer (implicit ACK)
+Byte 5: rx_ack_seq   cumulative ACK: next sequence number expected from peer
 Byte 6: snr_raw      local RX SNR as uint8 = round(snr_dB) + 128; 0=unknown
 Byte 7: ack_delay    IRS→ISS delay from data_rx to ack_tx, in 10ms units; 0=unknown
 ```
@@ -103,6 +106,33 @@ For **DATA frames** (`ARQ_DATA`), payload bytes follow immediately after byte 7.
 The payload size is determined by the FreeDV mode in use.
 For current `ARQ_CONTROL` and `ARQ_DATA` frames, the extension field is transmitted
 as `0` and reserved for future use.
+
+DATA-specific flag use:
+
+| Flag | Meaning |
+|------|---------|
+| `LEN_HI` (`0x20`) | Bit 8 of the valid-payload length carried in byte 7. Required for DATAC1 partial frames. |
+| `BURST_MORE` (`0x10`) | More consecutive DATA frames follow before the receiver should ACK. |
+
+### v5 burst and cumulative ACK
+
+Mercury v5 is no longer pure stop-and-wait for payload data. The ISS may send a
+short DATA burst in one modem action/PTT, then wait for one ACK from the IRS.
+The ACK's `rx_ack_seq` is the next sequence number the IRS expects, so it
+cumulatively acknowledges all earlier in-order frames.
+
+Burst limits are intentionally conservative for HF:
+
+| Mode | Max DATA frames per burst | Reason |
+|------|---------------------------|--------|
+| DATAC4 | 1 | Narrow/robust mode; preserve old stop-and-wait behavior. |
+| DATAC3 | 2 | Moderate throughput gain with bounded loss recovery cost. |
+| DATAC1 | 3 | High-SNR/high-backlog mode where ACK/turn overhead dominates. |
+
+If a burst frame is lost, the IRS ACKs the first missing sequence number. The ISS
+retransmits only the unACKed tail of the saved burst. After retries or unstable
+delivery, the ISS falls back to one-frame bursts until the link earns clean ACKs
+again.
 
 ### CALL/ACCEPT compact frame (ARQ_CALL, 14 bytes)
 
@@ -186,14 +216,15 @@ Empirical values from NVIS HF path OTA testing.  All times are seconds.
 | Mode    | Payload bytes | Frame duration | TX period | ACK timeout | Retry interval |
 |---------|---------------|----------------|-----------|-------------|----------------|
 | DATAC13 | 14            | 2.5 s          | 1.0 s     | 6.0 s       | 7.0 s          |
-| DATAC4  | 54            | 5.7 s          | 1.0 s     | 9.0 s       | 10.0 s         |
-| DATAC3  | 126           | 4.0 s          | 1.0 s     | 8.0 s       | 9.0 s          |
-| DATAC1  | 510           | 6.5 s          | 1.0 s     | 11.0 s      | 12.0 s         |
+| DATAC4  | 54            | 5.8 s          | 1.0 s     | 12.0 s      | 13.0 s         |
+| DATAC3  | 126           | 3.82 s         | 1.0 s     | 9.0 s       | 10.0 s         |
+| DATAC1  | 510           | 4.81 s         | 1.0 s     | 11.0 s      | 12.0 s         |
 
-- **ACK timeout**: measured from PTT-ON to ACK reception deadline.
-  `= frame_duration + channel_guard + ACK_return_time`, rounded up.
+- **ACK timeout**: measured from PTT-OFF after the current frame/burst.
+  It must cover DATAC13 ACK return plus guard and any piggybacked DATA response.
 - **Retry interval**: `= ack_timeout + ARQ_ACK_GUARD_S (1 s)`.
-- **Channel guard**: 400 ms after PTT-OFF before next TX may start.
+- **Channel guard**: 700 ms after frame decode before the IRS transmits ACK.
+- **ISS post-ACK guard**: 900 ms before the ISS resumes DATA TX after receiving ACK.
 
 These values are defined as constants in `arq_protocol.h` and can be tuned there.
 
@@ -257,11 +288,11 @@ ISS side:                              IRS side:
 
 IDLE_ISS ──(APP_DATA_READY)──► DATA_TX   IDLE_IRS ──(RX_DATA)──► DATA_RX
               │                   │                                    │
-              │ TX_STARTED         │ TX_COMPLETE                        │ (immediate ACK)
+              │ TX_STARTED         │ TX_COMPLETE                        │ (ACK after burst)
               ▼                   ▼                                    ▼
             DATA_TX           WAIT_ACK                              ACK_TX
               │                   │                                    │
-              │                   │ RX_ACK → next frame                │ TX_COMPLETE
+              │                   │ RX_ACK → next burst/tail           │ TX_COMPLETE
               │                   │ or retry / TURN_ACK                ▼
               │                   │                              IDLE_IRS (or TURN_REQ_TX
               │                   │                               if HAS_DATA was set)
@@ -276,10 +307,10 @@ Full state list:
 | State            | Description                                    |
 |------------------|------------------------------------------------|
 | IDLE_ISS         | ISS: no pending frame; waiting for TX data     |
-| DATA_TX          | ISS: frame queued or on air                    |
-| WAIT_ACK         | ISS: PTT-OFF; waiting for peer ACK             |
+| DATA_TX          | ISS: frame or short burst queued/on air        |
+| WAIT_ACK         | ISS: PTT-OFF; waiting for cumulative ACK       |
 | IDLE_IRS         | IRS: waiting for peer data frame               |
-| DATA_RX          | IRS: data frame decoded; ACK pending           |
+| DATA_RX          | IRS: data frame/burst decoded; ACK pending     |
 | ACK_TX           | IRS: ACK frame being transmitted               |
 | TURN_REQ_TX      | IRS→ISS: TURN_REQ being transmitted            |
 | TURN_REQ_WAIT    | IRS→ISS: waiting for TURN_ACK                 |

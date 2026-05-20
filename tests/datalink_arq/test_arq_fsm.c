@@ -20,6 +20,7 @@
 DEFINE_FFF_GLOBALS;
 
 #include "freedv/freedv_api.h"
+#include "framer.h"
 #include "arq_fsm.h"
 #include "arq_protocol.h"
 
@@ -62,6 +63,12 @@ static arq_fsm_callbacks_t test_callbacks = {
 
 static arq_session_t sess;
 static arq_timing_ctx_t timing;
+static uint8_t captured_tx_frame[4096];
+static size_t captured_tx_frame_size;
+static int captured_tx_mode;
+static int captured_tx_ptype;
+static int tx_read_remaining;
+static uint8_t tx_read_next_byte;
 
 /* ---- Helper: create a minimal event ---- */
 static arq_event_t make_event(arq_event_id_t id)
@@ -70,6 +77,28 @@ static arq_event_t make_event(arq_event_id_t id)
     memset(&ev, 0, sizeof(ev));
     ev.id = id;
     return ev;
+}
+
+static void capture_send_tx_frame(int packet_type, int mode,
+                                  size_t frame_size, const uint8_t *frame)
+{
+    captured_tx_ptype = packet_type;
+    captured_tx_mode = mode;
+    captured_tx_frame_size = frame_size;
+    if (frame_size > sizeof(captured_tx_frame))
+        frame_size = sizeof(captured_tx_frame);
+    memcpy(captured_tx_frame, frame, frame_size);
+}
+
+static int fake_tx_read_bytes(uint8_t *dst, size_t max_len)
+{
+    if (tx_read_remaining <= 0)
+        return 0;
+    int n = tx_read_remaining < (int)max_len ? tx_read_remaining : (int)max_len;
+    for (int i = 0; i < n; i++)
+        dst[i] = tx_read_next_byte++;
+    tx_read_remaining -= n;
+    return n;
 }
 
 /* ---- setUp / tearDown ---- */
@@ -94,6 +123,12 @@ void setUp(void)
     arq_fsm_set_timing(&timing);
     arq_fsm_set_callbacks(&test_callbacks);
     arq_fsm_init(&sess);
+    memset(captured_tx_frame, 0, sizeof(captured_tx_frame));
+    captured_tx_frame_size = 0;
+    captured_tx_mode = 0;
+    captured_tx_ptype = 0;
+    tx_read_remaining = 0;
+    tx_read_next_byte = 1;
 }
 
 void tearDown(void) { }
@@ -475,6 +510,126 @@ void test_idle_iss_large_backlog_direct_switches_to_datac1_after_clean_acks(void
     TEST_ASSERT_EQUAL_INT(0, sess.pending_tx_mode);
 }
 
+void test_datac3_large_backlog_sends_two_frame_burst(void)
+{
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_IDLE_ISS;
+    sess.role = ARQ_ROLE_CALLER;
+    sess.session_id = 0x42;
+    sess.payload_mode = FREEDV_MODE_DATAC3;
+    sess.peer_tx_mode = FREEDV_MODE_DATAC3;
+    sess.tx_retries_left = ARQ_DATA_RETRY_SLOTS;
+    fake_tx_backlog_fake.custom_fake = fake_tx_backlog_large_value;
+    fake_tx_read_fake.custom_fake = fake_tx_read_bytes;
+    fake_send_tx_frame_fake.custom_fake = capture_send_tx_frame;
+    tx_read_remaining = 260;
+
+    arq_event_t ev = make_event(ARQ_EV_APP_DATA_READY);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
+    TEST_ASSERT_EQUAL_INT(PACKET_TYPE_ARQ_DATA, captured_tx_ptype);
+    TEST_ASSERT_EQUAL_INT(FREEDV_MODE_DATAC3, captured_tx_mode);
+    TEST_ASSERT_EQUAL_size_t(126 * 2, captured_tx_frame_size);
+    TEST_ASSERT_EQUAL_INT(2, sess.tx_burst_count);
+    TEST_ASSERT_BITS(ARQ_FLAG_BURST_MORE, ARQ_FLAG_BURST_MORE,
+                     captured_tx_frame[ARQ_HDR_FLAGS_IDX]);
+    TEST_ASSERT_BITS(ARQ_FLAG_BURST_MORE, 0,
+                     captured_tx_frame[126 + ARQ_HDR_FLAGS_IDX]);
+    TEST_ASSERT_EQUAL_UINT8(0, captured_tx_frame[ARQ_HDR_SEQ_IDX]);
+    TEST_ASSERT_EQUAL_UINT8(1, captured_tx_frame[126 + ARQ_HDR_SEQ_IDX]);
+}
+
+void test_wait_ack_cumulative_ack_advances_full_burst(void)
+{
+    test_datac3_large_backlog_sends_two_frame_burst();
+    RESET_FAKE(fake_send_tx_frame);
+    fake_send_tx_frame_fake.custom_fake = capture_send_tx_frame;
+
+    arq_event_t ev = make_event(ARQ_EV_TX_COMPLETE);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_WAIT_ACK, sess.dflow_state);
+
+    fake_tx_backlog_fake.custom_fake = NULL;
+    fake_tx_backlog_fake.return_val = 0;
+    ev = make_event(ARQ_EV_RX_ACK);
+    ev.session_id = sess.session_id;
+    ev.ack_seq = 2;
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_UINT8(2, sess.tx_seq);
+    TEST_ASSERT_EQUAL_INT(0, sess.tx_burst_count);
+    TEST_ASSERT_EQUAL_INT(0, sess.tx_inflight_bytes);
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_IDLE_ISS, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(0, fake_send_tx_frame_fake.call_count);
+}
+
+void test_wait_ack_partial_ack_retransmits_unacked_tail(void)
+{
+    test_datac3_large_backlog_sends_two_frame_burst();
+    RESET_FAKE(fake_send_tx_frame);
+    fake_send_tx_frame_fake.custom_fake = capture_send_tx_frame;
+
+    arq_event_t ev = make_event(ARQ_EV_TX_COMPLETE);
+    arq_fsm_dispatch(&sess, &ev);
+
+    ev = make_event(ARQ_EV_RX_ACK);
+    ev.session_id = sess.session_id;
+    ev.ack_seq = 1;
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(1, sess.tx_burst_acked);
+    TEST_ASSERT_EQUAL_UINT8(1, sess.tx_seq);
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_DATA_TX, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
+    TEST_ASSERT_EQUAL_size_t(126, captured_tx_frame_size);
+    TEST_ASSERT_EQUAL_UINT8(1, captured_tx_frame[ARQ_HDR_SEQ_IDX]);
+    TEST_ASSERT_EQUAL_INT(ARQ_DATA_RETRY_SLOTS - 1, sess.tx_retries_left);
+}
+
+void test_irs_waits_for_burst_final_frame_before_ack(void)
+{
+    mock_set_uptime_ms(10000);
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_IDLE_IRS;
+    sess.role = ARQ_ROLE_CALLEE;
+    sess.session_id = 0x42;
+    sess.rx_expected = 0;
+
+    arq_event_t ev = make_event(ARQ_EV_RX_DATA);
+    ev.session_id = sess.session_id;
+    ev.seq = 0;
+    ev.mode = FREEDV_MODE_DATAC3;
+    ev.rx_flags = ARQ_FLAG_BURST_MORE;
+    ev.payload_len = 2;
+    ev.data_bytes = 2;
+    ev.payload[0] = 'a';
+    ev.payload[1] = 'b';
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_DATA_RX, sess.dflow_state);
+    TEST_ASSERT_EQUAL_UINT8(1, sess.rx_expected);
+    TEST_ASSERT_EQUAL_UINT64(10000 + 3820 + ARQ_BURST_NEXT_FRAME_MARGIN_MS,
+                             sess.deadline_ms);
+    TEST_ASSERT_EQUAL_INT(0, fake_send_tx_frame_fake.call_count);
+
+    mock_set_uptime_ms(12000);
+    ev = make_event(ARQ_EV_RX_DATA);
+    ev.session_id = sess.session_id;
+    ev.seq = 1;
+    ev.mode = FREEDV_MODE_DATAC3;
+    ev.rx_flags = 0;
+    ev.payload_len = 2;
+    ev.data_bytes = 2;
+    ev.payload[0] = 'c';
+    ev.payload[1] = 'd';
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_UINT8(2, sess.rx_expected);
+    TEST_ASSERT_EQUAL_UINT64(12000 + ARQ_CHANNEL_GUARD_MS, sess.deadline_ms);
+    TEST_ASSERT_EQUAL_INT(0, fake_send_tx_frame_fake.call_count);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -500,5 +655,9 @@ int main(void)
     RUN_TEST(test_idle_iss_large_backlog_uses_datac1_after_one_clean_ack_on_high_snr);
     RUN_TEST(test_idle_iss_large_backlog_blocks_datac1_fast_path_after_retry);
     RUN_TEST(test_idle_iss_large_backlog_direct_switches_to_datac1_after_clean_acks);
+    RUN_TEST(test_datac3_large_backlog_sends_two_frame_burst);
+    RUN_TEST(test_wait_ack_cumulative_ack_advances_full_burst);
+    RUN_TEST(test_wait_ack_partial_ack_retransmits_unacked_tail);
+    RUN_TEST(test_irs_waits_for_burst_final_frame_before_ack);
     return UNITY_END();
 }

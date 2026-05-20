@@ -1292,22 +1292,25 @@ void *tx_thread(void *g_modem)
             if (action_buffer &&
                 action_frame_size > 0 &&
                 action_frame_size <= INT_BUFFER_SIZE &&
-                action.frame_size == action_frame_size &&
-                size_buffer(action_buffer) >= action_frame_size)
+                action.frame_size >= action_frame_size &&
+                action.frame_size <= INT_BUFFER_SIZE &&
+                (action.frame_size % action_frame_size) == 0 &&
+                size_buffer(action_buffer) >= action.frame_size)
             {
-                if (data_size < action_frame_size)
+                int action_frames = (int)(action.frame_size / action_frame_size);
+                if (data_size < action.frame_size)
                 {
-                    uint8_t *new_data = (uint8_t *)realloc(data, action_frame_size);
+                    uint8_t *new_data = (uint8_t *)realloc(data, action.frame_size);
                     if (!new_data)
                     {
                         HLOGE("modem-tx", "Failed to allocate memory for action TX data");
                         continue;
                     }
                     data = new_data;
-                    data_size = action_frame_size;
+                    data_size = action.frame_size;
                 }
-                read_buffer(action_buffer, data, action_frame_size);
-                if (send_modulated_data_with_cq_status(modem, data, 1) == 0)
+                read_buffer(action_buffer, data, action.frame_size);
+                if (send_modulated_data_with_cq_status(modem, data, action_frames) == 0)
                     sent_from_action = true;
                 else
                     HLOGW("modem-tx", "Failed to send queued TX action");
