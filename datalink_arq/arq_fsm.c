@@ -1950,6 +1950,8 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
             }
             else
             {
+                HLOGW(LOG_COMP, "Keepalive miss %d/%d - probing again",
+                      sess->keepalive_miss_count, ARQ_KEEPALIVE_MISS_LIMIT);
                 send_ctrl_frame(sess, ARQ_SUBTYPE_KEEPALIVE);
                 tm = arq_protocol_mode_timing(sess->control_mode);
                 dflow_enter(sess, ARQ_DFLOW_KEEPALIVE_TX,

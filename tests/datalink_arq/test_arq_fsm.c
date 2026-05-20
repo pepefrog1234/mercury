@@ -446,6 +446,70 @@ void test_idle_irs_timer_requests_turn_for_queued_data(void)
     TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
 }
 
+void test_idle_irs_timer_does_not_probe_before_chat_idle_grace(void)
+{
+    mock_set_uptime_ms(1000 + ((uint64_t)ARQ_IRS_INACTIVITY_S * 1000) - 1);
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_IDLE_IRS;
+    sess.role = ARQ_ROLE_CALLEE;
+    sess.session_id = 0x42;
+    sess.last_rx_ms = 1000;
+    sess.deadline_event = ARQ_EV_TIMER_PEER_BACKLOG;
+    fake_tx_backlog_fake.return_val = 0;
+
+    arq_event_t ev = make_event(ARQ_EV_TIMER_PEER_BACKLOG);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_IDLE_IRS, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(ARQ_EV_TIMER_PEER_BACKLOG, sess.deadline_event);
+    TEST_ASSERT_EQUAL_INT(0, fake_send_tx_frame_fake.call_count);
+}
+
+void test_idle_irs_timer_probes_after_chat_idle_grace(void)
+{
+    mock_set_uptime_ms(1000 + ((uint64_t)ARQ_IRS_INACTIVITY_S * 1000));
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_IDLE_IRS;
+    sess.role = ARQ_ROLE_CALLEE;
+    sess.session_id = 0x42;
+    sess.control_mode = FREEDV_MODE_DATAC13;
+    sess.last_rx_ms = 1000;
+    sess.deadline_event = ARQ_EV_TIMER_PEER_BACKLOG;
+    fake_tx_backlog_fake.return_val = 0;
+    fake_send_tx_frame_fake.custom_fake = capture_send_tx_frame;
+
+    arq_event_t ev = make_event(ARQ_EV_TIMER_PEER_BACKLOG);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_KEEPALIVE_TX, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
+    TEST_ASSERT_EQUAL_INT(PACKET_TYPE_ARQ_CONTROL, captured_tx_ptype);
+    TEST_ASSERT_EQUAL_INT(FREEDV_MODE_DATAC13, captured_tx_mode);
+    TEST_ASSERT_EQUAL_UINT8(ARQ_SUBTYPE_KEEPALIVE,
+                            captured_tx_frame[ARQ_HDR_SUBTYPE_IDX]);
+}
+
+void test_keepalive_wait_retries_before_miss_limit(void)
+{
+    sess.conn_state = ARQ_CONN_CONNECTED;
+    sess.dflow_state = ARQ_DFLOW_KEEPALIVE_WAIT;
+    sess.role = ARQ_ROLE_CALLER;
+    sess.session_id = 0x42;
+    sess.control_mode = FREEDV_MODE_DATAC13;
+    sess.keepalive_miss_count = ARQ_KEEPALIVE_MISS_LIMIT - 2;
+    fake_send_tx_frame_fake.custom_fake = capture_send_tx_frame;
+
+    arq_event_t ev = make_event(ARQ_EV_TIMER_RETRY);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_DFLOW_KEEPALIVE_TX, sess.dflow_state);
+    TEST_ASSERT_EQUAL_INT(ARQ_KEEPALIVE_MISS_LIMIT - 1,
+                          sess.keepalive_miss_count);
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
+    TEST_ASSERT_EQUAL_UINT8(ARQ_SUBTYPE_KEEPALIVE,
+                            captured_tx_frame[ARQ_HDR_SUBTYPE_IDX]);
+}
+
 void test_idle_iss_short_backlog_direct_switches_to_datac3_on_wide_link(void)
 {
     mock_set_uptime_ms(20000);
@@ -698,6 +762,9 @@ int main(void)
     RUN_TEST(test_idle_irs_local_data_shortens_turn_request_timer);
     RUN_TEST(test_idle_irs_local_data_requests_turn_after_peer_silence);
     RUN_TEST(test_idle_irs_timer_requests_turn_for_queued_data);
+    RUN_TEST(test_idle_irs_timer_does_not_probe_before_chat_idle_grace);
+    RUN_TEST(test_idle_irs_timer_probes_after_chat_idle_grace);
+    RUN_TEST(test_keepalive_wait_retries_before_miss_limit);
     RUN_TEST(test_idle_iss_short_backlog_direct_switches_to_datac3_on_wide_link);
     RUN_TEST(test_idle_iss_large_backlog_uses_datac3_until_link_is_proven);
     RUN_TEST(test_idle_iss_large_backlog_uses_datac1_after_one_clean_ack_on_high_snr);

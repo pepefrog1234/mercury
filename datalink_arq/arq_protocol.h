@@ -225,13 +225,13 @@ extern _Atomic float arq_callint_override_s;
 #define ARQ_CONNECT_GRACE_SLOTS       2     /* extra wait slots for ACCEPT         */
 #define ARQ_CONNECT_BUSY_EXT_S        2     /* busy-extension guard after CALL     */
 #define ARQ_KEEPALIVE_INTERVAL_S      20    /* keepalive TX interval               */
-#define ARQ_KEEPALIVE_MISS_LIMIT      5     /* missed keepalives before disconnect */
+#define ARQ_KEEPALIVE_MISS_LIMIT      12    /* missed keepalives before disconnect */
 #define ARQ_TURN_REQ_RETRIES          2
 #define ARQ_MODE_REQ_RETRIES          2
 #define ARQ_PEER_PAYLOAD_HOLD_S       15    /* hold peer payload mode after activity */
-#define ARQ_IRS_INACTIVITY_CYCLES     4     /* TIMER_PEER_BACKLOG cycles without
+#define ARQ_IRS_INACTIVITY_CYCLES     20    /* TIMER_PEER_BACKLOG cycles without
                                             * RX before IRS keepalive probe
-                                            * (15s * 4 = 1 minute)            */
+                                            * (15s * 20 = 5 minutes)          */
 #define ARQ_IRS_INACTIVITY_S          (ARQ_PEER_PAYLOAD_HOLD_S * \
                                        ARQ_IRS_INACTIVITY_CYCLES)
 #define ARQ_MODE_SWITCH_HYST_COUNT    1     /* SNR provides stability gate; 1 = immediate */

@@ -473,13 +473,15 @@ DATAC3 as the fast interactive default and DATAC1 as an earned high-speed mode.
 ## Keepalive
 
 When the link is idle (no data in either direction):
-- Every `ARQ_KEEPALIVE_INTERVAL_S` (20 s), the current ISS sends a `KEEPALIVE` frame.
-- The IRS side waits `ARQ_IRS_INACTIVITY_S` (1 minute) without received frames
-  before probing with a `KEEPALIVE`, so stale links are detected before the GUI
-  application idle disconnect timer fires.
+- Normal chat idle does not send periodic air-link keepalives.  A connected
+  operator may simply be reading or typing, so silence is not treated as an
+  immediate fault.
+- The IRS side waits `ARQ_IRS_INACTIVITY_S` (5 minutes) without received frames
+  before probing with a `KEEPALIVE`.
 - The peer responds with `KEEPALIVE_ACK`.
-- If `ARQ_KEEPALIVE_MISS_LIMIT` (5) consecutive keepalives receive no reply,
-  the session is torn down with a local DISCONNECT.
+- If `ARQ_KEEPALIVE_MISS_LIMIT` (12) consecutive keepalives receive no reply,
+  the session is torn down with a local DISCONNECT.  This makes a quiet chat
+  tolerant of long pauses while still clearing a genuinely lost RF path.
 
 ---
 
@@ -625,10 +627,10 @@ All in `arq_protocol.h`:
 #define ARQ_DATA_RETRY_SLOTS_DEFAULT 10     /* DATA retries before disconnect   */
 #define ARQ_DISCONNECT_RETRY_SLOTS_DEFAULT 2
 #define ARQ_KEEPALIVE_INTERVAL_S      20
-#define ARQ_KEEPALIVE_MISS_LIMIT      5
+#define ARQ_KEEPALIVE_MISS_LIMIT      12
 #define ARQ_STARTUP_MAX_S             8     /* DATAC13-only startup window      */
 #define ARQ_PEER_PAYLOAD_HOLD_S       15    /* hold payload mode after activity */
-#define ARQ_IRS_INACTIVITY_CYCLES     4     /* 15s * 4 = 1 minute               */
+#define ARQ_IRS_INACTIVITY_CYCLES     20    /* 15s * 20 = 5 minutes             */
 #define ARQ_SNR_HYST_DB               1.0f
 #define ARQ_DATAC1_FAST_SNR_DB       10.0f
 #define ARQ_DATAC1_FAST_CLEAN_ACKS    1
