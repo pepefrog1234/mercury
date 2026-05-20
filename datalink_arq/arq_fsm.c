@@ -175,9 +175,12 @@ static void dflow_enter(arq_session_t *sess, arq_dflow_state_t new_state,
                         uint64_t deadline_ms, arq_event_id_t deadline_event)
 {
     if (sess->dflow_state != new_state)
+    {
         HLOGD(LOG_COMP, "dflow: %s -> %s",
               arq_dflow_state_name(sess->dflow_state),
               arq_dflow_state_name(new_state));
+        sess->dflow_enter_ms = hermes_uptime_ms();
+    }
     sess->dflow_state    = new_state;
     sess->deadline_ms    = deadline_ms;
     sess->deadline_event = deadline_event;
@@ -343,9 +346,15 @@ static int select_best_mode(const arq_session_t *sess, int backlog)
         float c1_thresh = (cur_rank >= mode_rank(FREEDV_MODE_DATAC1))
                           ? ARQ_SNR_MIN_DATAC1_DB
                           : ARQ_SNR_MIN_DATAC1_DB + ARQ_SNR_HYST_DB;
+        bool earned_datac1 =
+            sess->speed_level >= ARQ_DATAC1_MIN_STABILITY_LEVEL;
+        bool fast_datac1 =
+            peer_snr >= ARQ_DATAC1_FAST_SNR_DB &&
+            sess->tx_success_count >= ARQ_DATAC1_FAST_CLEAN_ACKS &&
+            sess->consecutive_retries == 0;
         if (peer_snr >= c1_thresh &&
             backlog >= ARQ_BACKLOG_MIN_DATAC1 &&
-            sess->speed_level >= ARQ_DATAC1_MIN_STABILITY_LEVEL)
+            (earned_datac1 || fast_datac1))
             return FREEDV_MODE_DATAC1;
     }
 
@@ -515,6 +524,18 @@ static void send_ctrl_frame(arq_session_t *sess, arq_subtype_t subtype)
     }
     if (n > 0)
         send_frame(PACKET_TYPE_ARQ_CONTROL, sess->control_mode, (size_t)n, frame);
+}
+
+static void request_turn_from_irs(arq_session_t *sess)
+{
+    const arq_mode_timing_t *tm;
+
+    send_ctrl_frame(sess, ARQ_SUBTYPE_TURN_REQ);
+    sess->tx_retries_left = ARQ_TURN_REQ_RETRIES;
+    tm = arq_protocol_mode_timing(sess->control_mode);
+    dflow_enter(sess, ARQ_DFLOW_TURN_REQ_TX,
+                deadline_from_s(tm ? tm->retry_interval_s : 7.0f),
+                ARQ_EV_TIMER_RETRY);
 }
 
 static void send_ack(arq_session_t *sess, uint8_t ack_delay_raw)
@@ -1436,12 +1457,7 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
             }
             else if (g_cbs.tx_backlog && g_cbs.tx_backlog() > 0)
             {
-                send_ctrl_frame(sess, ARQ_SUBTYPE_TURN_REQ);
-                sess->tx_retries_left = ARQ_TURN_REQ_RETRIES;
-                tm = arq_protocol_mode_timing(sess->control_mode);
-                dflow_enter(sess, ARQ_DFLOW_TURN_REQ_TX,
-                            deadline_from_s(tm ? tm->retry_interval_s : 7.0f),
-                            ARQ_EV_TIMER_RETRY);
+                request_turn_from_irs(sess);
             }
             else
             {
@@ -1450,14 +1466,28 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
         }
         else if (ev->id == ARQ_EV_APP_DATA_READY)
         {
-            /* IRS does not own the TX turn.  Keep the data queued and let
-             * TIMER_PEER_BACKLOG request the turn after the peer-hold window.
-             * If the ISS also just queued DATA, its frame will arrive first
-             * and our ACK can advertise HAS_DATA without colliding. */
-            if (sess->deadline_ms == UINT64_MAX ||
-                sess->deadline_event != ARQ_EV_TIMER_PEER_BACKLOG)
+            /* IRS does not own the TX turn.  Keep the data queued, but don't
+             * wait the full peer-hold window when the ISS is already silent.
+             * ARQ_TURN_WAIT_AFTER_ACK_MS covers the ISS ACK guard + one short
+             * data opportunity; after that, a TURN_REQ is a safe and much
+             * faster way to recover the channel for interactive replies. */
+            if (!(g_cbs.tx_backlog && g_cbs.tx_backlog() > 0))
+                break;
+
+            uint64_t now = hermes_uptime_ms();
+            uint64_t idle_since = sess->dflow_enter_ms ? sess->dflow_enter_ms : now;
+            uint64_t turn_at = idle_since + ARQ_TURN_WAIT_AFTER_ACK_MS;
+            if (now >= turn_at)
             {
-                enter_idle_irs(sess);
+                request_turn_from_irs(sess);
+            }
+            else if (sess->deadline_ms == UINT64_MAX ||
+                     sess->deadline_event != ARQ_EV_TIMER_PEER_BACKLOG ||
+                     sess->deadline_ms > turn_at)
+            {
+                dflow_enter(sess, ARQ_DFLOW_IDLE_IRS,
+                            turn_at,
+                            ARQ_EV_TIMER_PEER_BACKLOG);
             }
         }
         else if (ev->id == ARQ_EV_RX_TURN_REQ)

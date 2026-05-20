@@ -241,6 +241,8 @@ extern _Atomic float arq_callint_override_s;
 #define ARQ_LADDER_LEVELS             3     /* 0=DATAC4, 1=DATAC3, 2=DATAC1     */
 #define ARQ_LADDER_UP_SUCCESSES       4     /* clean ACKs required to step up    */
 #define ARQ_DATAC1_MIN_STABILITY_LEVEL 1    /* require one clean-ACK ladder step */
+#define ARQ_DATAC1_FAST_SNR_DB       10.0f  /* high-confidence fast path          */
+#define ARQ_DATAC1_FAST_CLEAN_ACKS    1     /* clean ACKs before DATAC1 fast path */
 #define ARQ_RETRY_DOWNGRADE_THRESHOLD 2     /* consecutive retries to force downgrade */
 #define ARQ_MODE_HOLD_AFTER_DOWNGRADE_S 15  /* hold lower mode after forced downgrade */
 

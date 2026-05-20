@@ -184,6 +184,7 @@ typedef struct
     /* --- Retry/timeout bookkeeping --- */
     int      tx_retries_left;          /* retries remaining for current frame  */
     uint64_t state_enter_ms;          /* when current conn_state was entered   */
+    uint64_t dflow_enter_ms;          /* when current dflow_state was entered  */
     uint64_t startup_deadline_ms;     /* end of DATAC13-only startup period    */
 
     /* --- Peer state observed from frames --- */

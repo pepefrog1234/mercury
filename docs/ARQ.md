@@ -374,6 +374,15 @@ The `ARQ_PEER_PAYLOAD_HOLD_S` constant (15 s) prevents the ISS from immediately
 downgrading the modem mode back to DATAC13 while the peer is expected to have
 more data.
 
+**Queued local data fast turn**
+- When the local side is IRS and new application data arrives, Mercury no longer
+  waits the full 15 s peer-hold window before asking for the turn.
+- If the peer has already been silent for `ARQ_TURN_WAIT_AFTER_ACK_MS` (3.5 s),
+  IRS sends `TURN_REQ` immediately.
+- If the data arrives earlier than that, Mercury shortens the peer-hold timer to
+  the 3.5 s mark.  This preserves a safe receive window for a possible next ISS
+  DATA frame, but avoids long idle gaps during interactive replies.
+
 ---
 
 ## Adaptive Rate Rules
@@ -408,6 +417,11 @@ DATAC3 as the fast interactive default and DATAC1 as an earned high-speed mode.
 - Requires `speed_level >= ARQ_DATAC1_MIN_STABILITY_LEVEL`.
 - `speed_level` rises only after `ARQ_LADDER_UP_SUCCESSES` (4) consecutive
   clean ACKs, so DATAC1 is used only after the link has proven itself.
+- High-confidence fast path: if peer SNR is at least `ARQ_DATAC1_FAST_SNR_DB`
+  (10 dB), there is a large backlog, and at least
+  `ARQ_DATAC1_FAST_CLEAN_ACKS` (1) clean ACK has arrived without retry history,
+  Mercury may use DATAC1 before the normal ladder step is earned.  Any retry
+  disables this shortcut until clean delivery resumes.
 
 **Downgrade and retry behavior**
 - Any DATA retry resets `speed_level` to 0, forcing DATAC1 to be re-earned.
@@ -564,7 +578,7 @@ the mode timing table in `arq_protocol.c`.
 | Spurious retries despite good SNR       | `ack_timeout_s` too short                 | Increase by 1–2 s in mode table        |
 | Link stuck at DATAC4, no mode upgrade   | SNR not high enough, or backlog too small | Check `ARQ_BACKLOG_MIN_DATAC3`         |
 | UUCP handshake fails (timeout)          | First few data frames lost in startup     | Increase `ARQ_STARTUP_MAX_S` or reduce startup guard behaviour |
-| Long gaps between turns                 | `ARQ_PEER_PAYLOAD_HOLD_S` too large       | Reduce to 8–10 s                       |
+| Long gaps between turns                 | Early turn request not firing, or peer still transmitting | Check `ARQ_TURN_WAIT_AFTER_ACK_MS` and turn logs |
 | Keepalive disconnects on idle link      | Propagation gap > keepalive window        | Increase `ARQ_KEEPALIVE_MISS_LIMIT`    |
 
 ### Timing constants quick reference
@@ -572,17 +586,21 @@ the mode timing table in `arq_protocol.c`.
 All in `arq_protocol.h`:
 
 ```c
-#define ARQ_CHANNEL_GUARD_MS          400   /* ms after PTT-OFF before next TX  */
+#define ARQ_CHANNEL_GUARD_MS          700   /* IRS response guard after decode  */
+#define ARQ_ISS_POST_ACK_GUARD_MS     900   /* ISS guard before DATA after ACK  */
+#define ARQ_TURN_WAIT_AFTER_ACK_MS   3500   /* queued IRS data fast-turn wait   */
 #define ARQ_ACK_GUARD_S               1     /* slack added to retry interval    */
-#define ARQ_CALL_RETRY_SLOTS          4     /* CALL retries                     */
-#define ARQ_DATA_RETRY_SLOTS          10    /* DATA retries before disconnect   */
-#define ARQ_DISCONNECT_RETRY_SLOTS    2
+#define ARQ_CALL_RETRY_SLOTS_DEFAULT  4     /* CALL retries                     */
+#define ARQ_DATA_RETRY_SLOTS_DEFAULT 10     /* DATA retries before disconnect   */
+#define ARQ_DISCONNECT_RETRY_SLOTS_DEFAULT 2
 #define ARQ_KEEPALIVE_INTERVAL_S      20
 #define ARQ_KEEPALIVE_MISS_LIMIT      5
 #define ARQ_STARTUP_MAX_S             8     /* DATAC13-only startup window      */
 #define ARQ_PEER_PAYLOAD_HOLD_S       15    /* hold payload mode after activity */
 #define ARQ_IRS_INACTIVITY_CYCLES     4     /* 15s * 4 = 1 minute               */
 #define ARQ_SNR_HYST_DB               1.0f
+#define ARQ_DATAC1_FAST_SNR_DB       10.0f
+#define ARQ_DATAC1_FAST_CLEAN_ACKS    1
 ```
 
 ---
