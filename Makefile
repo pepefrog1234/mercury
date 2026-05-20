@@ -187,6 +187,7 @@ clean:
 	$(MAKE) -C gui_interface clean
 	$(MAKE) -C radio_io clean
 	$(MAKE) -C utils clean
+	$(MAKE) -C tests clean
 
 doxygen:
 	@command -v $(DOXYGEN) >/dev/null 2>&1 || { echo "ERROR: doxygen not found"; exit 1; }

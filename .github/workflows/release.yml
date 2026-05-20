@@ -25,8 +25,8 @@ on:
 jobs:
   release:
     name: Release Mercury v${{ inputs.version }}
-    runs-on: ubuntu-latest
-    container: debian:trixie
+    runs-on: ubuntu-24.04
+    container: debian:13.5
     timeout-minutes: 20
     permissions:
       contents: write
@@ -92,7 +92,7 @@ jobs:
           # Query GitHub directly for PRs merged into mercuryv2 after that date,
           # sorted oldest-first so the changelog order matches the release history.
           PR_TITLES=$(gh pr list \
-            --repo Rhizomatica/mercury \
+            --repo "${{ github.repository }}" \
             --state merged \
             --base mercuryv2 \
             --search "merged:>${LAST_TAG_DATE}" \
@@ -150,6 +150,6 @@ jobs:
           ZIP_FILE=$(ls mercury-${{ inputs.version }}-w64-*.zip)
           gh release create "v${{ inputs.version }}" \
             "./${ZIP_FILE}" \
-            --repo Rhizomatica/mercury \
+            --repo "${{ github.repository }}" \
             --target mercuryv2 \
             --generate-notes

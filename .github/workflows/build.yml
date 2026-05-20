@@ -1,187 +1,156 @@
-# Mercury CI Pipeline - Build Verification
-#
-# Triggers:
-#   - Automatically on every Pull Request
-#   - Manually via workflow_dispatch (select which targets to build)
-#   - Automatically on every push to mercuryv2
-#
-# Builds:
-#   - Linux amd64 (native, Debian 13)
-#   - Linux arm64 (cross-compile, Debian 13)
-#   - Windows x64 (cross-compile via MinGW, Debian 13)
-
-name: Build
+name: Modem packages
 
 on:
-  pull_request:
-    branches: [mercuryv2]
   push:
-    branches: [mercuryv2]
+    branches:
+      - mercuryv2
+  pull_request:
+    branches:
+      - mercuryv2
   workflow_dispatch:
-    inputs:
-      branch:
-        description: 'Target branch | default = "mercuryv2"'
-        required: false
-        type: string
-        default: 'mercuryv2'
-      build_linux_amd64:
-        description: 'Build Linux amd64'
-        type: boolean
-        default: true
-      build_linux_arm64:
-        description: 'Build Linux arm64 (cross-compile)'
-        type: boolean
-        default: true
-      build_windows:
-        description: 'Build Windows x64 (cross-compile)'
-        type: boolean
-        default: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  build-linux-amd64:
-    name: Build Linux amd64 (Debian 13)
-    runs-on: ubuntu-latest
-    container: debian:trixie
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.event_name == 'push' ||
-      github.event.inputs.build_linux_amd64 == 'true'
-    timeout-minutes: 5
+  linux-debian-amd64:
+    name: Linux Debian 13.5 amd64
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:13.5
+    timeout-minutes: 20
 
     steps:
+      - name: Install checkout tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Debian amd64 environment
+        run: |
+          . /etc/os-release
+          echo "Debian $VERSION_ID / $(dpkg --print-architecture)"
+          test "$VERSION_ID" = "13"
+          test "$(dpkg --print-architecture)" = "amd64"
+
       - name: Install build dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential \
-            git \
-            openssh-client \
-            libpulse-dev \
+            file \
             libasound2-dev \
-            libhamlib-dev
+            libhamlib-dev \
+            libpulse-dev
+
+      - name: Build
+        run: |
+          make clean
+          make -j"$(nproc)"
+
+      - name: Unit tests
+        run: make test
+
+      - name: Package
+        run: |
+          short_sha="$(git rev-parse --short=8 HEAD)"
+          version="$(grep 'define VERSION__' main.c | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+          package_name="mercury-$version-linux-debian13.5-amd64-$short_sha"
+          package_dir="dist/$package_name"
+          mkdir -p "$package_dir"
+
+          cp mercury "$package_dir/"
+          cp mercury.ini.example "$package_dir/"
+          cp mercury.1 "$package_dir/"
+          cp LICENSE LICENSE-freedv "$package_dir/"
+          file "$package_dir/mercury" > "$package_dir/BINARY-INFO.txt"
+          ldd "$package_dir/mercury" > "$package_dir/RUNTIME-LIBS.txt"
+
+          cat > "$package_dir/README-DEBIAN.txt" <<EOF
+          Mercury modem Linux Debian 13.5 amd64 package
+
+          Run:
+            ./mercury
+
+          Runtime dependencies:
+            sudo apt-get install libasound2t64 libhamlib4t64 libpulse0
+
+          Build metadata:
+            Mercury commit: $GITHUB_SHA
+            Debian image: debian:13.5
+            Architecture: amd64
+            Hamlib CAT support: enabled
+          EOF
+
+          tar -C dist -czf "dist/$package_name.tar.gz" "$package_name"
+          echo "PACKAGE_TGZ=dist/$package_name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mercury-modem-linux-debian13.5-amd64
+          path: ${{ env.PACKAGE_TGZ }}
+          if-no-files-found: error
+
+  windows-x64:
+    name: Windows x64
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:13.5
+    timeout-minutes: 20
+
+    steps:
+      - name: Install checkout tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            git
 
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          repository: Rhizomatica/mercury
-          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
           fetch-depth: 0
-          ref: ${{ github.event.inputs.branch || github.event.pull_request.head.sha || github.sha }}
 
-      - name: Git Safe Directory
-        run: git config --global --add safe.directory /__w/mercury/mercury
-
-      - name: Build Mercury (Linux amd64)
-        shell: bash
+      - name: Verify Debian amd64 environment
         run: |
-          make clean
-          make -j$(nproc) 2>&1
-          echo "BUILD_EXIT_CODE=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+          . /etc/os-release
+          echo "Debian $VERSION_ID / $(dpkg --print-architecture)"
+          test "$VERSION_ID" = "13"
+          test "$(dpkg --print-architecture)" = "amd64"
 
-      - name: Check build result
-        run: |
-          if [ "$BUILD_EXIT_CODE" != "0" ]; then
-            echo "::error::Linux amd64 build failed"
-            exit 1
-          fi
-          echo "Linux amd64 build succeeded"
-
-  build-linux-arm64:
-    name: Build Linux arm64 (cross-compile, Debian 13)
-    runs-on: ubuntu-latest
-    container: debian:trixie
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.event_name == 'push' ||
-      github.event.inputs.build_linux_arm64 == 'true'
-    timeout-minutes: 5
-
-    steps:
       - name: Install build dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential \
-            git \
-            openssh-client \
-            gcc-aarch64-linux-gnu
+            file \
+            gcc-mingw-w64-x86-64 \
+            mingw-w64-common \
+            mingw-w64-tools \
+            mingw-w64-x86-64-dev \
+            zip
 
-      - name: Enable arm64 multiarch
+      - name: Build Windows zip
+        run: make windows-zip
+
+      - name: Verify Windows binary
         run: |
-          dpkg --add-architecture arm64
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            libpulse-dev:arm64 \
-            libasound2-dev:arm64 \
-            libhamlib-dev:arm64
+          file mercury.exe
+          zip_file="$(ls mercury-*-w64-*.zip | head -1)"
+          test -n "$zip_file"
+          echo "PACKAGE_ZIP=$zip_file" >> "$GITHUB_ENV"
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          repository: Rhizomatica/mercury
-          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
-          fetch-depth: 0
-          ref: ${{ github.event.inputs.branch || github.event.pull_request.head.sha || github.sha }}
-
-      - name: Git Safe Directory
-        run: git config --global --add safe.directory /__w/mercury/mercury
-
-      - name: Build Mercury (Linux arm64 cross-compile)
-        shell: bash
-        run: |
-          make clean
-          make -j$(nproc) CC=aarch64-linux-gnu-gcc 2>&1
-          echo "BUILD_EXIT_CODE=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
-
-      - name: Check build result
-        run: |
-          if [ "$BUILD_EXIT_CODE" != "0" ]; then
-            echo "::error::Linux arm64 cross-compile failed"
-            exit 1
-          fi
-          echo "Linux arm64 cross-compile succeeded"
-
-  build-windows:
-    name: Build Windows x64 (cross-compile, Debian 13)
-    runs-on: ubuntu-latest
-    container: debian:trixie
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.event_name == 'push' ||
-      github.event.inputs.build_windows == 'true'
-    timeout-minutes: 5
-
-    steps:
-      - name: Install build dependencies
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential \
-            git \
-            openssh-client \
-            gcc-mingw-w64-x86-64
-
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          repository: Rhizomatica/mercury
-          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
-          fetch-depth: 0
-          ref: ${{ github.event.inputs.branch || github.event.pull_request.head.sha || github.sha }}
-
-      - name: Git Safe Directory
-        run: git config --global --add safe.directory /__w/mercury/mercury
-
-      - name: Build Mercury (Windows x64 cross-compile)
-        shell: bash
-        run: |
-          make windows 2>&1
-          echo "BUILD_EXIT_CODE=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
-
-      - name: Check build result
-        run: |
-          if [ "$BUILD_EXIT_CODE" != "0" ]; then
-            echo "::error::Windows x64 cross-compile failed"
-            exit 1
-          fi
-          echo "Windows x64 cross-compile succeeded"
+          name: mercury-modem-windows-x64
+          path: ${{ env.PACKAGE_ZIP }}
+          if-no-files-found: error
