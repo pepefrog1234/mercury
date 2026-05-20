@@ -586,7 +586,18 @@ static void send_call_accept(arq_session_t *sess, bool is_accept)
         n = arq_protocol_build_call(frame, sizeof(frame), sess->session_id,
                                     my_call, sess->remote_call, bw_hz);
     if (n > 0)
+    {
+        HLOGI(LOG_COMP, "%s queued: %s -> %s, %d Hz",
+              is_accept ? "ACCEPT" : "CALL",
+              my_call, sess->remote_call, bw_hz);
         send_frame(PACKET_TYPE_ARQ_CALL, sess->control_mode, (size_t)n, frame);
+    }
+    else
+    {
+        HLOGW(LOG_COMP, "Failed to build %s frame: %s -> %s, %d Hz",
+              is_accept ? "ACCEPT" : "CALL",
+              my_call, sess->remote_call, bw_hz);
+    }
 }
 
 static void send_ctrl_frame(arq_session_t *sess, arq_subtype_t subtype)
@@ -1115,6 +1126,7 @@ static void fsm_calling(arq_session_t *sess, const arq_event_t *ev)
         if (sess->tx_retries_left > 0)
         {
             sess->tx_retries_left--;
+            HLOGI(LOG_COMP, "CALL retry tx, remaining=%d", sess->tx_retries_left);
             send_call_accept(sess, false);
             sess->deadline_ms = deadline_from_s(arq_protocol_call_interval_s());
         }
@@ -1187,6 +1199,7 @@ static void fsm_accepting(arq_session_t *sess, const arq_event_t *ev)
         if (sess->tx_retries_left > 0)
         {
             sess->tx_retries_left--;
+            HLOGI(LOG_COMP, "ACCEPT tx, remaining=%d", sess->tx_retries_left);
             send_call_accept(sess, true);
             /* deadline is now managed via TX_COMPLETE above; set a generous
              * fallback here in case TX_COMPLETE is missed for any reason */

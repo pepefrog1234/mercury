@@ -475,6 +475,19 @@ static void *arq_event_loop_worker(void *arg)
 
     while (g_running)
     {
+        /* Fire overdue timers before entering pthread_cond_timedwait().  This
+         * keeps CALL/ACCEPT guards and retries from depending on a zero-timeout
+         * condvar wakeup, which is a little too subtle for handshake-critical
+         * work. */
+        uint64_t due_now = hermes_uptime_ms();
+        if (g_sess.deadline_ms != UINT64_MAX && due_now >= g_sess.deadline_ms)
+        {
+            arq_event_t tev = { .id = g_sess.deadline_event };
+            g_sess.deadline_ms = UINT64_MAX;
+            arq_fsm_dispatch(&g_sess, &tev);
+            continue;
+        }
+
         uint64_t now   = hermes_uptime_ms();
         int timeout_ms = arq_fsm_timeout_ms(&g_sess, now);
         if (timeout_ms > 500 || timeout_ms < 0)

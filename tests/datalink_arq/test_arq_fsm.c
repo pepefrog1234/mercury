@@ -123,6 +123,8 @@ void setUp(void)
     arq_fsm_set_timing(&timing);
     arq_fsm_set_callbacks(&test_callbacks);
     arq_fsm_init(&sess);
+    snprintf(arq_conn.my_call_sign, CALLSIGN_MAX_SIZE, "%s", "TESTME");
+    arq_conn.bw = ARQ_BANDWIDTH_FULL_HZ;
     memset(captured_tx_frame, 0, sizeof(captured_tx_frame));
     captured_tx_frame_size = 0;
     captured_tx_mode = 0;
@@ -182,6 +184,50 @@ void test_incoming_call_transitions_to_accepting(void)
     TEST_ASSERT_EQUAL_UINT8(0x42, sess.session_id);
     /* notify_pending should have been called */
     TEST_ASSERT_GREATER_THAN(0, fake_notify_pending_fake.call_count);
+}
+
+void test_incoming_call_timer_sends_accept(void)
+{
+    arq_event_t ev = make_event(ARQ_EV_APP_LISTEN);
+    arq_fsm_dispatch(&sess, &ev);
+
+    ev = make_event(ARQ_EV_RX_CALL);
+    ev.session_id = 0x42;
+    strncpy(ev.remote_call, "REMOTE1", CALLSIGN_MAX_SIZE);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_CONN_ACCEPTING, sess.conn_state);
+    TEST_ASSERT_EQUAL_INT(0, fake_send_tx_frame_fake.call_count);
+
+    ev = make_event(ARQ_EV_TIMER_RETRY);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
+    TEST_ASSERT_EQUAL_INT(ARQ_CONN_ACCEPTING, sess.conn_state);
+}
+
+void test_calling_tx_complete_preserves_retry_deadline(void)
+{
+    arq_event_t ev = make_event(ARQ_EV_APP_LISTEN);
+    arq_fsm_dispatch(&sess, &ev);
+
+    ev = make_event(ARQ_EV_APP_CONNECT);
+    strncpy(ev.remote_call, "DST1", CALLSIGN_MAX_SIZE);
+    arq_fsm_dispatch(&sess, &ev);
+    TEST_ASSERT_EQUAL_INT(ARQ_CONN_CALLING, sess.conn_state);
+    uint64_t deadline = sess.deadline_ms;
+    RESET_FAKE(fake_send_tx_frame);
+
+    ev = make_event(ARQ_EV_TX_COMPLETE);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(ARQ_CONN_CALLING, sess.conn_state);
+    TEST_ASSERT_EQUAL_UINT64(deadline, sess.deadline_ms);
+
+    ev = make_event(ARQ_EV_TIMER_RETRY);
+    arq_fsm_dispatch(&sess, &ev);
+
+    TEST_ASSERT_EQUAL_INT(1, fake_send_tx_frame_fake.call_count);
 }
 
 /* RX_ACCEPT from CALLING transitions to CONNECTED */
@@ -638,6 +684,8 @@ int main(void)
     RUN_TEST(test_listen_transitions_to_listening);
     RUN_TEST(test_connect_transitions_to_calling);
     RUN_TEST(test_incoming_call_transitions_to_accepting);
+    RUN_TEST(test_incoming_call_timer_sends_accept);
+    RUN_TEST(test_calling_tx_complete_preserves_retry_deadline);
     RUN_TEST(test_accept_transitions_to_connected);
     RUN_TEST(test_disconnect_from_connected);
     RUN_TEST(test_rx_disconnect_from_connected);
