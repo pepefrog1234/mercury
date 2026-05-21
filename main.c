@@ -131,13 +131,28 @@ static void print_usage(const char *prog)
 #endif
     printf(" -C [config_file]           Path to init configuration file (INI format). Default is mercury.ini in the current directory.\n");
     printf(" -K                         List HAMLIB supported radio models.\n");
+    printf(" -V                         Prints this Mercury modem version and git hash.\n");
     printf(" -t                         Test TX mode.\n");
     printf(" -r                         Test RX mode.\n");
     printf(" -h                         Prints this help.\n");
 }
 
+static void print_version(void)
+{
+    printf("Rhizomatica Mercury Version %s (git %.8s)\n", VERSION__, GIT_HASH);
+}
+
 int main(int argc, char *argv[])
 {
+    for (int i = 1; i < argc; ++i)
+    {
+        if (!strcmp(argv[i], "-V") || !strcmp(argv[i], "--version"))
+        {
+            print_version();
+            return EXIT_SUCCESS;
+        }
+    }
+
 #if defined(__linux__)
     printf("\e[0;31mRhizomatica Mercury Version %s (git %.8s)\e[0m\n", VERSION__, GIT_HASH); // we go red
 #elif defined(_WIN32)
@@ -186,7 +201,7 @@ int main(int argc, char *argv[])
 
     // --- Load init configuration file ---
     // First pass: extract -C config path only
-    const char *optstring = "hc:s:m:f:H:k:Y:li:o:x:p:b:zvtrL:JR:U:A:C:SKWGT";
+    const char *optstring = "hc:s:m:f:H:k:Y:li:o:x:p:b:zvtrL:JR:U:A:C:SKWGTV";
     const char *cfg_path = "mercury.ini";
     int opt;
     while ((opt = getopt(argc, argv, optstring)) != -1)
@@ -410,6 +425,9 @@ int main(int argc, char *argv[])
             break;
         case 'h':
             print_usage(argv[0]);
+            return EXIT_SUCCESS;
+        case 'V':
+            print_version();
             return EXIT_SUCCESS;
         default:
             print_usage(argv[0]);

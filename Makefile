@@ -70,7 +70,7 @@ include config.mk
 MINGW_CC  = x86_64-w64-mingw32-gcc
 MINGW_AR  = x86_64-w64-mingw32-ar
 
-.PHONY: all install internal_deps utils clean doxygen doxygen-clean windows windows-zip test FORCE
+.PHONY: all install internal_deps utils clean doxygen doxygen-clean windows windows-zip test loopback-smoke tnc-loopback-smoke preflight FORCE
 
 prefix ?= /usr
 bindir ?= $(prefix)/bin
@@ -199,3 +199,12 @@ doxygen-clean:
 
 test:
 	$(MAKE) -C tests test
+
+loopback-smoke: all
+	./tools/loopback-smoke-test.sh
+
+tnc-loopback-smoke: all
+	python3 ./tools/tnc-loopback-smoke-test.py --mercury-bin ./$(BINARY)
+
+preflight:
+	./tools/preflight-check.sh
