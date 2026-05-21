@@ -262,6 +262,9 @@ static const AudioObjectPropertyAddress prop_odev_fmt = {
 static const AudioObjectPropertyAddress prop_idev_fmt = {
 	kAudioDevicePropertyStreamFormat, kAudioDevicePropertyScopeInput, kAudioObjectPropertyElementMaster
 };
+static const AudioObjectPropertyAddress prop_dev_nominal_rate = {
+	kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster
+};
 
 static const AudioObjectPropertyAddress prop_idev_default = {
 	kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster
@@ -278,6 +281,40 @@ static int coreaudio_dev_default(ffuint capture)
 	if (r != 0)
 		return -1;
 	return dev;
+}
+
+static int coreaudio_device_channels(AudioObjectID dev, ffuint capture)
+{
+	const AudioObjectPropertyAddress *a = (capture) ? &prop_dev_inconf : &prop_dev_outconf;
+	AudioBufferList *bufs = NULL;
+	ffuint size = 0;
+	int channels = 0;
+
+	if (AudioObjectGetPropertyDataSize(dev, a, 0, NULL, &size) != kAudioHardwareNoError)
+		return 0;
+
+	bufs = ffmem_alloc(size);
+	if (bufs == NULL)
+		return 0;
+
+	if (AudioObjectGetPropertyData(dev, a, 0, NULL, &size, bufs) == kAudioHardwareNoError) {
+		for (ffuint i = 0; i != bufs->mNumberBuffers; i++)
+			channels += bufs->mBuffers[i].mNumberChannels;
+	}
+
+	ffmem_free(bufs);
+	return channels;
+}
+
+static double coreaudio_device_nominal_rate(AudioObjectID dev)
+{
+	Float64 rate = 0;
+	ffuint size = sizeof(rate);
+
+	if (AudioObjectGetPropertyData(dev, &prop_dev_nominal_rate, 0, NULL,
+	                               &size, &rate) != kAudioHardwareNoError)
+		return 0;
+	return rate;
 }
 
 int ffcoreaudio_open(ffaudio_buf *b, ffaudio_conf *conf, ffuint flags)
@@ -301,6 +338,17 @@ int ffcoreaudio_open(ffaudio_buf *b, ffaudio_conf *conf, ffuint flags)
 	ffuint size = sizeof(asbd);
 	const AudioObjectPropertyAddress *a = (capture) ? &prop_idev_fmt : &prop_odev_fmt;
 	if (0 != AudioObjectGetPropertyData(dev, a, 0, NULL, &size, &asbd)) {
+		/* Aggregate/virtual devices and some USB codecs don't expose
+		 * kAudioDevicePropertyStreamFormat at device scope.  The IOProc still
+		 * supplies float buffers, so fall back to nominal rate + stream layout. */
+		asbd.mSampleRate = coreaudio_device_nominal_rate(dev);
+		asbd.mChannelsPerFrame = coreaudio_device_channels(dev, capture);
+	}
+	if (asbd.mSampleRate <= 0)
+		asbd.mSampleRate = coreaudio_device_nominal_rate(dev);
+	if (asbd.mChannelsPerFrame == 0)
+		asbd.mChannelsPerFrame = coreaudio_device_channels(dev, capture);
+	if (asbd.mSampleRate <= 0 || asbd.mChannelsPerFrame == 0) {
 		b->errfunc = "AudioStreamBasicDescription";
 		return -1;
 	}
