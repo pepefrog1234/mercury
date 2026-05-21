@@ -12,6 +12,9 @@
 #include <stdbool.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <string.h>
 #include "os_interop.h"
 #include <ffaudio/audio.h>
 #include "std.h"
@@ -62,6 +65,101 @@ static int str_to_guid(const char *s, GUID *g)
     for (int i = 0; i < 8; i++)
         g->Data4[i] = (unsigned char)d4[i];
     return 0;
+}
+
+static int ascii_equal_ci(const char *a, const char *b)
+{
+    if (!a || !b)
+        return 0;
+
+    while (*a && *b)
+    {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
+        if (tolower(ca) != tolower(cb))
+            return 0;
+    }
+
+    return *a == '\0' && *b == '\0';
+}
+
+static int audio_device_label_matches(const char *requested, const char *name, const char *id)
+{
+    size_t name_len;
+
+    if (!requested || !requested[0])
+        return 0;
+
+    if (id && id[0] && strcmp(requested, id) == 0)
+        return 1;
+
+    if (name && name[0] && (strcmp(requested, name) == 0 || ascii_equal_ci(requested, name)))
+        return 1;
+
+    if (name && id && name[0] && id[0])
+    {
+        name_len = strlen(name);
+        if (strncmp(requested, name, name_len) == 0 &&
+            strncmp(requested + name_len, " [", 2) == 0 &&
+            strstr(requested + name_len, id) != NULL)
+            return 1;
+    }
+
+    return 0;
+}
+
+/* Windows users may select a friendly device name from Qt or a settings file,
+ * while WASAPI needs an MMDevice ID and DirectSound needs a GUID.  Accept all
+ * three forms to avoid opening no audio device while radio/CAT control still
+ * appears to work.  Return 0 when resolved_id was filled, 1 when the matching
+ * device is the subsystem default with no ID, and -1 when no match was found. */
+static int resolve_windows_audio_device_id(ffaudio_interface *audio,
+                                           unsigned mode,
+                                           const char *requested,
+                                           char *resolved_id,
+                                           size_t resolved_id_size)
+{
+    ffaudio_dev *d;
+    int rc = -1;
+
+    if (!audio || !requested || !requested[0] || !resolved_id || resolved_id_size == 0)
+        return -1;
+
+    d = audio->dev_alloc(mode);
+    if (!d)
+        return -1;
+
+    for (;;)
+    {
+        int r = audio->dev_next(d);
+        const char *id;
+        const char *name;
+
+        if (r != 0)
+            break;
+
+        id = audio->dev_info(d, FFAUDIO_DEV_ID);
+        name = audio->dev_info(d, FFAUDIO_DEV_NAME);
+
+        if (!audio_device_label_matches(requested, name, id))
+            continue;
+
+        if (id && id[0])
+        {
+            int written = snprintf(resolved_id, resolved_id_size, "%s", id);
+            if (written >= 0 && (size_t)written < resolved_id_size)
+                rc = 0;
+        }
+        else
+        {
+            resolved_id[0] = '\0';
+            rc = 1;
+        }
+        break;
+    }
+
+    audio->dev_free(d);
+    return rc;
 }
 
 #endif /* _WIN32 */
@@ -282,6 +380,10 @@ void *radio_playback_thread(void *device_ptr)
     ffaudio_interface *audio = NULL;
     struct conf conf = {};
     int coreaudio_device_id = -1;
+#if defined(_WIN32)
+    char windows_device_id[2048];
+    GUID play_guid;
+#endif
     conf.buf.app_name = "mercury_playback";
     conf.buf.format = FFAUDIO_F_INT32;
     conf.buf.sample_rate = 48000;
@@ -323,15 +425,6 @@ void *radio_playback_thread(void *device_ptr)
         return NULL;
     }
 
-#if defined(_WIN32)
-    /* DirectSound device IDs are GUID strings from get_soundcard_list().
-     * Convert back to binary GUID for the DirectSound API. */
-    GUID play_guid;
-    if (audio_subsystem == AUDIO_SUBSYSTEM_DSOUND && conf.buf.device_id &&
-        conf.buf.device_id[0] == '{' && str_to_guid(conf.buf.device_id, &play_guid) == 0)
-        conf.buf.device_id = (const char *)&play_guid;
-#endif
-
     conf.flags = FFAUDIO_PLAYBACK;
     ffaudio_init_conf aconf = {};
     aconf.app_name = "mercury_playback";
@@ -371,6 +464,49 @@ void *radio_playback_thread(void *device_ptr)
     {
         did_init_play = true;
     }
+
+#if defined(_WIN32)
+    if (conf.buf.device_id)
+    {
+        const char *requested_device = conf.buf.device_id;
+        int resolved = resolve_windows_audio_device_id(audio, FFAUDIO_DEV_PLAYBACK,
+                                                       requested_device,
+                                                       windows_device_id,
+                                                       sizeof(windows_device_id));
+        if (resolved == 0)
+        {
+            conf.buf.device_id = windows_device_id;
+            if (strcmp(requested_device, windows_device_id) != 0)
+                HLOGI("audio-play", "Resolved Windows playback device '%s' -> '%s'",
+                      requested_device, windows_device_id);
+        }
+        else if (resolved == 1)
+        {
+            HLOGI("audio-play", "Resolved Windows playback device '%s' -> default",
+                  requested_device);
+            conf.buf.device_id = NULL;
+        }
+        else if (audio_subsystem == AUDIO_SUBSYSTEM_DSOUND &&
+                 requested_device[0] != '{')
+        {
+            HLOGE("audio-play", "DirectSound playback device '%s' was not found; using default",
+                  requested_device);
+            conf.buf.device_id = NULL;
+        }
+
+        if (audio_subsystem == AUDIO_SUBSYSTEM_DSOUND && conf.buf.device_id)
+        {
+            if (conf.buf.device_id[0] == '{' && str_to_guid(conf.buf.device_id, &play_guid) == 0)
+                conf.buf.device_id = (const char *)&play_guid;
+            else
+            {
+                HLOGE("audio-play", "Invalid DirectSound playback device '%s'; using default",
+                      requested_device);
+                conf.buf.device_id = NULL;
+            }
+        }
+    }
+#endif
 
 #if defined(__APPLE__)
     if (audio_subsystem == AUDIO_SUBSYSTEM_COREAUDIO && conf.buf.device_id &&
@@ -582,6 +718,10 @@ void *radio_capture_thread(void *device_ptr)
     ffaudio_interface *audio = NULL;
     struct conf conf = {};
     int coreaudio_device_id = -1;
+#if defined(_WIN32)
+    char windows_device_id[2048];
+    GUID cap_guid;
+#endif
     conf.buf.app_name = "mercury_capture";
     conf.buf.format = FFAUDIO_F_INT32;
     conf.buf.sample_rate = 48000;
@@ -623,15 +763,6 @@ void *radio_capture_thread(void *device_ptr)
         return NULL;
     }
 
-#if defined(_WIN32)
-    /* DirectSound device IDs are GUID strings from get_soundcard_list().
-     * Convert back to binary GUID for the DirectSound API. */
-    GUID cap_guid;
-    if (audio_subsystem == AUDIO_SUBSYSTEM_DSOUND && conf.buf.device_id &&
-        conf.buf.device_id[0] == '{' && str_to_guid(conf.buf.device_id, &cap_guid) == 0)
-        conf.buf.device_id = (const char *)&cap_guid;
-#endif
-
     conf.flags = FFAUDIO_CAPTURE;
     ffaudio_init_conf aconf = {};
     aconf.app_name = "mercury_capture";
@@ -671,6 +802,49 @@ void *radio_capture_thread(void *device_ptr)
     {
         did_init_cap = true;
     }
+
+#if defined(_WIN32)
+    if (conf.buf.device_id)
+    {
+        const char *requested_device = conf.buf.device_id;
+        int resolved = resolve_windows_audio_device_id(audio, FFAUDIO_DEV_CAPTURE,
+                                                       requested_device,
+                                                       windows_device_id,
+                                                       sizeof(windows_device_id));
+        if (resolved == 0)
+        {
+            conf.buf.device_id = windows_device_id;
+            if (strcmp(requested_device, windows_device_id) != 0)
+                HLOGI("audio-cap", "Resolved Windows capture device '%s' -> '%s'",
+                      requested_device, windows_device_id);
+        }
+        else if (resolved == 1)
+        {
+            HLOGI("audio-cap", "Resolved Windows capture device '%s' -> default",
+                  requested_device);
+            conf.buf.device_id = NULL;
+        }
+        else if (audio_subsystem == AUDIO_SUBSYSTEM_DSOUND &&
+                 requested_device[0] != '{')
+        {
+            HLOGE("audio-cap", "DirectSound capture device '%s' was not found; using default",
+                  requested_device);
+            conf.buf.device_id = NULL;
+        }
+
+        if (audio_subsystem == AUDIO_SUBSYSTEM_DSOUND && conf.buf.device_id)
+        {
+            if (conf.buf.device_id[0] == '{' && str_to_guid(conf.buf.device_id, &cap_guid) == 0)
+                conf.buf.device_id = (const char *)&cap_guid;
+            else
+            {
+                HLOGE("audio-cap", "Invalid DirectSound capture device '%s'; using default",
+                      requested_device);
+                conf.buf.device_id = NULL;
+            }
+        }
+    }
+#endif
 
 #if defined(__APPLE__)
     if (audio_subsystem == AUDIO_SUBSYSTEM_COREAUDIO && conf.buf.device_id &&
