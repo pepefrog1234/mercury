@@ -294,6 +294,30 @@ BITRATE\r
 
 ---
 
+### TXGAIN
+
+Set the TX audio output gain as a percentage without restarting the modem.
+This only scales audio sent to the playback device; it does not change PTT,
+ARQ bitrate selection, or the negotiated bandwidth token.
+
+```
+TXGAIN 100\r
+TXGAIN 75\r
+TXGAIN 0\r
+TXGAIN 200\r
+```
+
+Valid values are `0` through `200`. `100` is unity gain, `0` mutes modem
+TX audio, and `200` doubles the sample amplitude. Avoid overdriving the
+radio input or ALC.
+
+The startup/default value can also be set with the `-Y` command-line option
+or `tx_audio_gain_percent` in the INI file.
+
+**Response:** `OK\r` on success, `WRONG\r` on error.
+
+---
+
 ### RETRIES
 
 Override the amount of retries Mercury will try to connect or retry a transmission before giving up.
