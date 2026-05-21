@@ -588,8 +588,12 @@ static int append_comp_real_samples(int32_t *tx_buffer,
 
     for (int i = 0; i < sample_count; i++)
     {
-        int16_t sample = (int16_t)samples[i].real;
-        tx_buffer[(*total_samples)++] = (int32_t)sample << 16;
+        int32_t sample = (int32_t)samples[i].real;
+        if (sample > INT16_MAX)
+            sample = INT16_MAX;
+        else if (sample < INT16_MIN)
+            sample = INT16_MIN;
+        tx_buffer[(*total_samples)++] = sample * 65536;
     }
 
     return 0;
@@ -597,9 +601,21 @@ static int append_comp_real_samples(int32_t *tx_buffer,
 
 int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_per_burst)
 {
+    int freedv_mode = 0;
+
     pthread_mutex_lock(&modem_freedv_lock);
-    struct freedv *freedv = g_modem->freedv;
-    int freedv_mode = freedv_get_mode(freedv);
+    freedv_mode = g_modem->mode;
+    pthread_mutex_unlock(&modem_freedv_lock);
+
+    struct freedv *freedv = open_freedv_mode_locked(freedv_mode);
+    if (!freedv)
+    {
+        HLOGE("modem-tx", "Failed to open TX FreeDV mode %d", freedv_mode);
+        return -1;
+    }
+    freedv_set_frames_per_burst(freedv, frames_per_burst);
+    HLOGD("modem-tx", "TX modulation start mode=%d frames=%d", freedv_mode, frames_per_burst);
+
     size_t bytes_per_modem_frame = freedv_get_bits_per_modem_frame(freedv) / 8;
     size_t payload_bytes = bytes_per_modem_frame - 2;  /* 2 bytes reserved for CRC16 */
     size_t n_mod_out = freedv_get_n_tx_modem_samples(freedv);
@@ -642,7 +658,7 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
         printf("ERROR: Failed to allocate TX buffer\n");
         if (tx_buffer) free(tx_buffer);
         if (mod_out_comp) free(mod_out_comp);
-        pthread_mutex_unlock(&modem_freedv_lock);
+        freedv_close(freedv);
         return -1;
     }
 
@@ -656,20 +672,23 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
         tx_buffer[total_samples++] = 0;
 
     /* Generate preamble */
+    HLOGD("modem-tx", "TX modulation preamble begin");
     int n_preamble = freedv_rawdatapreamblecomptx(freedv, mod_out_comp);
+    HLOGD("modem-tx", "TX modulation preamble samples=%d", n_preamble);
     if (append_comp_real_samples(tx_buffer, max_samples, &total_samples,
                                  mod_out_comp, n_preamble) < 0)
     {
         HLOGE("modem-tx", "TX buffer overflow while generating preamble");
         free(tx_buffer);
         free(mod_out_comp);
-        pthread_mutex_unlock(&modem_freedv_lock);
+        freedv_close(freedv);
         return -1;
     }
 
     /* Generate data frame(s) */
     for (int i = 0; i < frames_per_burst; i++)
     {
+        HLOGD("modem-tx", "TX modulation data frame %d begin", i);
         /* Copy payload and add CRC16 in last 2 bytes */
         memcpy(frame_with_crc, &bytes_in[payload_bytes * i], payload_bytes);
         uint16_t crc16 = freedv_gen_crc16(frame_with_crc, payload_bytes);
@@ -677,26 +696,29 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
         frame_with_crc[bytes_per_modem_frame - 1] = crc16 & 0xff;
 
         freedv_rawdatacomptx(freedv, mod_out_comp, frame_with_crc);
+        HLOGD("modem-tx", "TX modulation data frame %d samples=%zu", i, n_mod_out);
         if (append_comp_real_samples(tx_buffer, max_samples, &total_samples,
                                      mod_out_comp, (int)n_mod_out) < 0)
         {
             HLOGE("modem-tx", "TX buffer overflow while generating data frame");
             free(tx_buffer);
             free(mod_out_comp);
-            pthread_mutex_unlock(&modem_freedv_lock);
+            freedv_close(freedv);
             return -1;
         }
     }
 
     /* Generate postamble */
+    HLOGD("modem-tx", "TX modulation postamble begin");
     int n_postamble = freedv_rawdatapostamblecomptx(freedv, mod_out_comp);
+    HLOGD("modem-tx", "TX modulation postamble samples=%d", n_postamble);
     if (append_comp_real_samples(tx_buffer, max_samples, &total_samples,
                                  mod_out_comp, n_postamble) < 0)
     {
         HLOGE("modem-tx", "TX buffer overflow while generating postamble");
         free(tx_buffer);
         free(mod_out_comp);
-        pthread_mutex_unlock(&modem_freedv_lock);
+        freedv_close(freedv);
         return -1;
     }
 
@@ -705,8 +727,8 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
     {
         tx_buffer[total_samples++] = 0;
     }
-    pthread_mutex_unlock(&modem_freedv_lock);
-
+    freedv_close(freedv);
+    HLOGD("modem-tx", "TX modulation complete samples=%zu", total_samples);
 
     /* === STEP 2: Key transmitter and send pre-generated audio === */
 
@@ -747,14 +769,13 @@ static void report_tx_bitrate_for_data_frame(generic_modem_t *g_modem,
         return;
 
     uint32_t bitrate_bps = 0;
-    int freedv_mode = 0;
-    pthread_mutex_lock(&modem_freedv_lock);
-    if (g_modem->freedv)
+    int freedv_mode = g_modem->mode;
+    struct freedv *freedv = open_freedv_mode_locked(freedv_mode);
+    if (freedv)
     {
-        freedv_mode = freedv_get_mode(g_modem->freedv);
-        bitrate_bps = compute_bitrate_bps_locked(g_modem->freedv);
+        bitrate_bps = compute_bitrate_bps_locked(freedv);
+        freedv_close(freedv);
     }
-    pthread_mutex_unlock(&modem_freedv_lock);
 
     if (bitrate_bps > 0)
         tnc_send_tx_bitrate(bitrate_level_from_payload_mode(freedv_mode), bitrate_bps);
@@ -1274,13 +1295,19 @@ void *tx_thread(void *g_modem)
         {
             cbuf_handle_t action_buffer = NULL;
             size_t action_frame_size = payload_bytes_per_modem_frame;
+            HLOGD("modem-tx", "TX action received type=%d mode=%d size=%zu",
+                  action.type, action.mode, action.frame_size);
             if (action.mode >= 0 &&
                 arq_policy_ready)
                 maybe_switch_modem_mode(modem, action.mode, RX, true);
+            HLOGD("modem-tx", "TX action mode ready type=%d mode=%d",
+                  action.type, action.mode);
 
             pthread_mutex_lock(&modem_freedv_lock);
             action_frame_size = modem->payload_bytes_per_modem_frame;
             pthread_mutex_unlock(&modem_freedv_lock);
+            HLOGD("modem-tx", "TX action frame check modem_frame=%zu action_size=%zu",
+                  action_frame_size, action.frame_size);
 
             if (action.type == ARQ_ACTION_TX_CONTROL)
                 action_buffer = data_tx_buffer_arq_control;
@@ -1310,10 +1337,17 @@ void *tx_thread(void *g_modem)
                     data_size = action.frame_size;
                 }
                 read_buffer(action_buffer, data, action.frame_size);
+                HLOGD("modem-tx", "TX action sending %d frame(s)", action_frames);
                 if (send_modulated_data_with_cq_status(modem, data, action_frames) == 0)
                     sent_from_action = true;
                 else
                     HLOGW("modem-tx", "Failed to send queued TX action");
+            }
+            else if (action_buffer)
+            {
+                HLOGW("modem-tx",
+                      "TX action skipped: modem_frame=%zu action_size=%zu buffer=%zu",
+                      action_frame_size, action.frame_size, size_buffer(action_buffer));
             }
         }
 

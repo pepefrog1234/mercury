@@ -667,6 +667,9 @@ static void send_data_frame(arq_session_t *sess)
     if (!g_cbs.tx_read || !g_cbs.tx_backlog)
         return;
 
+    HLOGD(LOG_COMP, "send_data_frame: mode=%d backlog=%d burst_count=%d",
+          sess->payload_mode, g_cbs.tx_backlog(), sess->tx_burst_count);
+
     const arq_mode_timing_t *tm = arq_protocol_mode_timing(sess->payload_mode);
     if (!tm)
         return;
@@ -728,6 +731,8 @@ static void send_data_frame(arq_session_t *sess)
     {
         memset(payloads[i], 0, user_bytes);
         int payload_len = g_cbs.tx_read(payloads[i], user_bytes);
+        HLOGD(LOG_COMP, "send_data_frame: tx_read len=%d user_bytes=%zu",
+              payload_len, user_bytes);
         if (payload_len <= 0)
             break;
         payload_lens[i] = payload_len;
@@ -798,6 +803,8 @@ static void send_data_frame(arq_session_t *sess)
 
     send_frame_burst(PACKET_TYPE_ARQ_DATA, sess->payload_mode,
                      frame_size, count, frames);
+    HLOGD(LOG_COMP, "send_data_frame: queued %d frame(s), frame_size=%zu",
+          count, frame_size);
 }
 
 static int acked_frames_in_burst(const arq_session_t *sess, uint8_t ack_seq)
@@ -1364,9 +1371,14 @@ static void fsm_dflow(arq_session_t *sess, const arq_event_t *ev)
     switch (sess->dflow_state)
     {
     case ARQ_DFLOW_IDLE_ISS:
-        if (ev->id == ARQ_EV_APP_DATA_READY && g_cbs.tx_backlog &&
-            g_cbs.tx_backlog() > 0)
+        if (ev->id == ARQ_EV_APP_DATA_READY && g_cbs.tx_backlog)
         {
+            int backlog = g_cbs.tx_backlog();
+            if (backlog <= 0)
+            {
+                HLOGD(LOG_COMP, "APP_DATA_READY ignored in IDLE_ISS: empty backlog");
+                break;
+            }
             bool initial_guard = sess->need_initial_guard;
             sess->need_initial_guard = false;
 

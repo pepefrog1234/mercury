@@ -214,6 +214,10 @@ struct ffaudio_buf {
 	ffuint period_ms;
 	ffuint overrun;
 	ffuint nonblock;
+	ffuint channels;
+	ffuint sample_size;
+	char *conv;
+	ffsize conv_cap;
 	ffstr buf_locked;
 	ffring_head rhead;
 
@@ -235,6 +239,7 @@ void ffcoreaudio_free(ffaudio_buf *b)
 
 	ffring_free(b->ring);
 	AudioDeviceDestroyIOProcID(b->dev, b->aprocid);
+	ffmem_free(b->conv);
 	ffmem_free(b);
 }
 
@@ -334,6 +339,8 @@ int ffcoreaudio_open(ffaudio_buf *b, ffaudio_conf *conf, ffuint flags)
 		goto end;
 	}
 	b->period_ms = conf->buffer_length_msec / 4;
+	b->channels = conf->channels;
+	b->sample_size = (conf->format & 0xff) / 8;
 
 	b->dev = dev;
 	rc = 0;
@@ -342,6 +349,51 @@ end:
 	if (rc != 0)
 		AudioDeviceDestroyIOProcID(b->dev, b->aprocid);
 	return rc;
+}
+
+static int coreaudio_reserve_conv(ffaudio_buf *b, ffsize size)
+{
+	if (b->conv_cap >= size)
+		return 0;
+
+	char *p = (char*)ffmem_realloc(b->conv, size);
+	if (p == NULL)
+		return -1;
+	b->conv = p;
+	b->conv_cap = size;
+	return 0;
+}
+
+static size_t coreaudio_ring_read_bytes(ffaudio_buf *b, char *dst, size_t len)
+{
+	size_t done = 0;
+
+	while (done != len) {
+		ffstr s;
+		ffring_head h = ffring_read_begin(b->ring, len - done, &s, NULL);
+		if (s.len == 0)
+			break;
+		memcpy(dst + done, s.ptr, s.len);
+		done += s.len;
+		ffring_read_finish(b->ring, h);
+	}
+
+	if (done != len) {
+		memset(dst + done, 0, len - done);
+		b->overrun = 1;
+	}
+
+	return done;
+}
+
+static void coreaudio_ring_write_bytes(ffaudio_buf *b, const char *data, size_t len)
+{
+	ffuint r = ffring_write(b->ring, data, len);
+	if (r != len) {
+		r += ffring_write(b->ring, data + r, len - r);
+		if (r != len)
+			b->overrun = 1;
+	}
 }
 
 int ffcoreaudio_start(ffaudio_buf *b)
@@ -373,33 +425,56 @@ static OSStatus coreaudio_ioproc_playback(AudioDeviceID device, const AudioTimeS
 	AudioBufferList *outdata, const AudioTimeStamp *outtime,
 	void *udata)
 {
-	char *d = (char*)outdata->mBuffers[0].mData;
-	size_t n = outdata->mBuffers[0].mDataByteSize;
-
 	ffaudio_buf *b = udata;
-	ffstr s;
-	ffring_head h = ffring_read_begin(b->ring, n, &s, NULL);
-	if (s.len == 0)
-		goto end;
-	memcpy(d, s.ptr, s.len);
-	d += s.len;
-	n -= s.len;
-	ffring_read_finish(b->ring, h);
+	const ffuint sample_size = b->sample_size ? b->sample_size : sizeof(float);
 
-	if (n != 0) {
-		h = ffring_read_begin(b->ring, n, &s, NULL);
-		if (s.len == 0)
-			goto end;
-		memcpy(d, s.ptr, s.len);
-		d += s.len;
-		n -= s.len;
-		ffring_read_finish(b->ring, h);
+	if (outdata->mNumberBuffers <= 1) {
+		char *d = (char*)outdata->mBuffers[0].mData;
+		size_t n = outdata->mBuffers[0].mDataByteSize;
+		coreaudio_ring_read_bytes(b, d, n);
+		return 0;
 	}
 
-end:
-	if (n != 0) {
-		memset(d, 0, n);
+	ffuint channels = 0;
+	size_t frames = 0;
+	for (ffuint bi = 0; bi != outdata->mNumberBuffers; bi++) {
+		AudioBuffer *ab = &outdata->mBuffers[bi];
+		if (ab->mNumberChannels == 0)
+			continue;
+		size_t bframes = ab->mDataByteSize / (ab->mNumberChannels * sample_size);
+		if (frames == 0 || bframes < frames)
+			frames = bframes;
+		channels += ab->mNumberChannels;
+	}
+	if (frames == 0 || channels == 0)
+		return 0;
+
+	size_t need = frames * channels * sample_size;
+	if (coreaudio_reserve_conv(b, need) != 0) {
+		for (ffuint bi = 0; bi != outdata->mNumberBuffers; bi++)
+			memset(outdata->mBuffers[bi].mData, 0, outdata->mBuffers[bi].mDataByteSize);
 		b->overrun = 1;
+		return 0;
+	}
+
+	coreaudio_ring_read_bytes(b, b->conv, need);
+
+	ffuint ch0 = 0;
+	for (ffuint bi = 0; bi != outdata->mNumberBuffers; bi++) {
+		AudioBuffer *ab = &outdata->mBuffers[bi];
+		char *dst = (char*)ab->mData;
+		ffuint bch = ab->mNumberChannels;
+		size_t active = frames * bch * sample_size;
+		for (size_t frame = 0; frame != frames; frame++) {
+			for (ffuint ch = 0; ch != bch; ch++) {
+				memcpy(dst + ((frame * bch + ch) * sample_size),
+				       b->conv + ((frame * channels + ch0 + ch) * sample_size),
+				       sample_size);
+			}
+		}
+		if (ab->mDataByteSize > active)
+			memset(dst + active, 0, ab->mDataByteSize - active);
+		ch0 += bch;
 	}
 
 	return 0;
@@ -416,16 +491,52 @@ static OSStatus coreaudio_ioproc_capture(AudioDeviceID device, const AudioTimeSt
 	AudioBufferList *outdata, const AudioTimeStamp *outtime,
 	void *udata)
 {
-	const float *d = indata->mBuffers[0].mData;
-	size_t n = indata->mBuffers[0].mDataByteSize;
-
 	ffaudio_buf *b = udata;
-	ffuint r = ffring_write(b->ring, d, n);
-	if (r != n) {
-		r += ffring_write(b->ring, (char*)d + r, n - r);
-		if (r != n)
-			b->overrun = 1;
+	const ffuint sample_size = b->sample_size ? b->sample_size : sizeof(float);
+
+	if (indata->mNumberBuffers <= 1) {
+		const char *d = (const char*)indata->mBuffers[0].mData;
+		size_t n = indata->mBuffers[0].mDataByteSize;
+		coreaudio_ring_write_bytes(b, d, n);
+		return 0;
 	}
+
+	ffuint channels = 0;
+	size_t frames = 0;
+	for (ffuint bi = 0; bi != indata->mNumberBuffers; bi++) {
+		const AudioBuffer *ab = &indata->mBuffers[bi];
+		if (ab->mNumberChannels == 0)
+			continue;
+		size_t bframes = ab->mDataByteSize / (ab->mNumberChannels * sample_size);
+		if (frames == 0 || bframes < frames)
+			frames = bframes;
+		channels += ab->mNumberChannels;
+	}
+	if (frames == 0 || channels == 0)
+		return 0;
+
+	size_t need = frames * channels * sample_size;
+	if (coreaudio_reserve_conv(b, need) != 0) {
+		b->overrun = 1;
+		return 0;
+	}
+
+	ffuint ch0 = 0;
+	for (ffuint bi = 0; bi != indata->mNumberBuffers; bi++) {
+		const AudioBuffer *ab = &indata->mBuffers[bi];
+		const char *src = (const char*)ab->mData;
+		ffuint bch = ab->mNumberChannels;
+		for (size_t frame = 0; frame != frames; frame++) {
+			for (ffuint ch = 0; ch != bch; ch++) {
+				memcpy(b->conv + ((frame * channels + ch0 + ch) * sample_size),
+				       src + ((frame * bch + ch) * sample_size),
+				       sample_size);
+			}
+		}
+		ch0 += bch;
+	}
+
+	coreaudio_ring_write_bytes(b, b->conv, need);
 	return 0;
 }
 
@@ -453,7 +564,7 @@ int ffcoreaudio_write(ffaudio_buf *b, const void *data, ffsize len)
 		if (b->nonblock)
 			return 0;
 
-		usleep(b->period_ms*1000);
+		usleep(1000);
 	}
 }
 
@@ -476,7 +587,7 @@ int ffcoreaudio_drain(ffaudio_buf *b)
 		if (b->nonblock)
 			return 0;
 
-		usleep(b->period_ms*1000);
+		usleep(1000);
 	}
 }
 
@@ -493,7 +604,7 @@ int ffcoreaudio_read(ffaudio_buf *b, const void **buffer)
 		if (b->nonblock)
 			return 0;
 
-		usleep(b->period_ms*1000);
+		usleep(1000);
 	}
 }
 

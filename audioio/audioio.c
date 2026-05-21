@@ -447,7 +447,7 @@ void *radio_playback_thread(void *device_ptr)
         audio = (ffaudio_interface *) &ffoss;
 #elif defined(__APPLE__)
     conf.buf.buffer_length_msec = 40;
-    period_ms = conf.buf.buffer_length_msec / 4;
+    period_ms = conf.buf.buffer_length_msec / 2;
     if (audio_subsystem == AUDIO_SUBSYSTEM_COREAUDIO)
         audio = (ffaudio_interface *) &ffcoreaudio;
 #endif
@@ -785,7 +785,7 @@ void *radio_capture_thread(void *device_ptr)
     if (audio_subsystem == AUDIO_SUBSYSTEM_OSS)
         audio = (ffaudio_interface *) &ffoss;
 #elif defined(__APPLE__)
-    conf.buf.buffer_length_msec = 40;
+    conf.buf.buffer_length_msec = 200;
     if (audio_subsystem == AUDIO_SUBSYSTEM_COREAUDIO)
         audio = (ffaudio_interface *) &ffcoreaudio;
 #endif

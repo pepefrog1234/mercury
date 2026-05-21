@@ -157,7 +157,12 @@ static void cb_send_tx_frame(int packet_type, int mode,
         .mode       = mode,
         .frame_size = frame_size,
     };
-    arq_modem_enqueue(&action);
+    if (arq_modem_enqueue(&action) != 0)
+        HLOGW(LOG_COMP, "TX action enqueue failed (ptype=%d mode=%d size=%zu)",
+              packet_type, mode, frame_size);
+    else
+        HLOGD(LOG_COMP, "TX action queued (ptype=%d mode=%d size=%zu)",
+              packet_type, mode, frame_size);
 }
 
 static void cb_notify_connected(const char *remote_call)
@@ -455,8 +460,15 @@ static void *arq_payload_bridge_worker(void *arg)
         if (payload.len == 0 || payload.len > INT_BUFFER_SIZE)
             continue;
         pthread_mutex_lock(&g_app_tx_mtx);
-        write_buffer(g_app_tx_buf, payload.data, payload.len);
+        int rc = write_buffer(g_app_tx_buf, payload.data, payload.len);
+        size_t backlog = size_buffer(g_app_tx_buf);
         pthread_mutex_unlock(&g_app_tx_mtx);
+        if (rc != 0)
+        {
+            HLOGW(LOG_COMP, "TCP payload queue failed len=%zu", payload.len);
+            continue;
+        }
+        HLOGD(LOG_COMP, "TCP payload queued len=%zu backlog=%zu", payload.len, backlog);
 
         arq_event_t ev = { .id = ARQ_EV_APP_DATA_READY };
         evq_push(&ev);
