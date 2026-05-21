@@ -39,6 +39,7 @@ void cfg_set_defaults(mercury_config *cfg)
     cfg->radio_device[0]    = '\0';
     cfg->input_device[0]    = '\0';
     cfg->output_device[0]   = '\0';
+    cfg->tx_audio_gain_percent = 100;
     cfg->capture_channel    = LEFT;
     cfg->sound_system       = -1;  /* auto: resolved by audioio_pick_default_subsystem() */
     cfg->arq_tcp_base_port  = DEFAULT_ARQ_PORT;       /* 8300   */
@@ -121,6 +122,10 @@ bool cfg_read(mercury_config *cfg, const char *ini_path)
         strncpy(cfg->output_device, s, sizeof(cfg->output_device) - 1);
         cfg->output_device[sizeof(cfg->output_device) - 1] = '\0';
     }
+
+    i = iniparser_getint(ini, CFG_KEY_TX_AUDIO_GAIN, cfg->tx_audio_gain_percent);
+    if (i >= 0 && i <= 200)
+        cfg->tx_audio_gain_percent = i;
 
     s = iniparser_getstring(ini, CFG_KEY_CAPTURE_CHANNEL, NULL);
     if (s)
@@ -221,6 +226,7 @@ bool cfg_write(const mercury_config *cfg, const char *ini_path)
     cfg_escape_str(escaped, sizeof(escaped), cfg->output_device);
     fprintf(f, "output_device = \"%s\"\n", escaped);
 
+    fprintf(f, "tx_audio_gain_percent = %d\n", cfg->tx_audio_gain_percent);
     fprintf(f, "capture_channel = %s\n",  capture_channel_name(cfg->capture_channel));
     fprintf(f, "sound_system = %s\n",     sound_system_name(cfg->sound_system));
     fprintf(f, "arq_tcp_base_port = %d\n", cfg->arq_tcp_base_port);

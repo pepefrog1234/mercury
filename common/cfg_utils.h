@@ -33,6 +33,7 @@
 #define CFG_KEY_RADIO_DEVICE        "main:radio_device"
 #define CFG_KEY_INPUT_DEVICE        "main:input_device"
 #define CFG_KEY_OUTPUT_DEVICE       "main:output_device"
+#define CFG_KEY_TX_AUDIO_GAIN       "main:tx_audio_gain_percent"
 #define CFG_KEY_CAPTURE_CHANNEL     "main:capture_channel"
 #define CFG_KEY_SOUND_SYSTEM        "main:sound_system"
 #define CFG_KEY_ARQ_TCP_BASE_PORT   "main:arq_tcp_base_port"
@@ -52,6 +53,7 @@ typedef struct {
     char     radio_device[1024];
     char     input_device[512];
     char     output_device[512];
+    int      tx_audio_gain_percent; /* 0..200, 100 = unity */
     int      capture_channel;       /* LEFT / RIGHT / STEREO */
     int      sound_system;          /* AUDIO_SUBSYSTEM_* or -1 for auto */
     int      arq_tcp_base_port;

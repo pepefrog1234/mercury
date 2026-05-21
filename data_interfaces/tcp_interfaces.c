@@ -82,6 +82,7 @@ extern cbuf_handle_t data_rx_buffer_broadcast;
 extern volatile bool shutdown_;
 
 extern arq_info arq_conn;
+extern int audioio_set_playback_gain_percent(int percent);
 
 static ssize_t send_all(int socket_fd, const uint8_t *buffer, size_t len)
 {
@@ -356,6 +357,23 @@ static void execute_control_command(char *buffer)
             tcp_write(CTL_TCP_PORT, (uint8_t *)"OK\r", 3);
         else
             tcp_write(CTL_TCP_PORT, (uint8_t *)"WRONG\r", 6);
+        return;
+    }
+
+    if (!memcmp(buffer, "TXGAIN", strlen("TXGAIN")))
+    {
+        int gain_percent = 0;
+        if (sscanf(buffer, "TXGAIN %d", &gain_percent) == 1 &&
+            gain_percent >= 0 && gain_percent <= 200)
+        {
+            gain_percent = audioio_set_playback_gain_percent(gain_percent);
+            HLOGI("tcp-ctl", "TX audio output gain set to %d%%", gain_percent);
+            tcp_write(CTL_TCP_PORT, (uint8_t *)"OK\r", 3);
+        }
+        else
+        {
+            tcp_write(CTL_TCP_PORT, (uint8_t *)"WRONG\r", 6);
+        }
         return;
     }
 

@@ -126,6 +126,20 @@ bool radio_io_enabled(void) { return false; }
 void radio_io_key_on(void) { }
 void radio_io_key_off(void) { }
 
+/* ---- audioio stubs ---- */
+
+static int mock_tx_gain_percent = 100;
+
+int audioio_set_playback_gain_percent(int percent)
+{
+    if (percent < 0)
+        percent = 0;
+    if (percent > 200)
+        percent = 200;
+    mock_tx_gain_percent = percent;
+    return mock_tx_gain_percent;
+}
+
 /* ---- ring_buffer stubs ---- */
 
 size_t size_buffer(cbuf_handle_t cbuf) { (void)cbuf; return 0; }
@@ -222,6 +236,7 @@ void setUp(void)
     chan_select_call_count = 0;
     memset(&arq_conn, 0, sizeof(arq_conn));
     mock_bandwidth_hz = 2300;
+    mock_tx_gain_percent = 100;
 
     /* Broadcast framing state */
     memset(last_write_buffer_data, 0, sizeof(last_write_buffer_data));
@@ -575,6 +590,25 @@ void test_cmd_callint_negative(void)
     assert_wrong_response();
 }
 
+void test_cmd_txgain_valid(void)
+{
+    char cmd[] = "TXGAIN 75";
+    execute_control_command(cmd);
+
+    assert_ok_response();
+    TEST_ASSERT_EQUAL_INT(0, captured_cmd_count);
+    TEST_ASSERT_EQUAL_INT(75, mock_tx_gain_percent);
+}
+
+void test_cmd_txgain_invalid(void)
+{
+    char cmd[] = "TXGAIN 250";
+    execute_control_command(cmd);
+
+    assert_wrong_response();
+    TEST_ASSERT_EQUAL_INT(100, mock_tx_gain_percent);
+}
+
 /* ---- Broadcast framing helper tests ---- */
 
 /* Expected Mercury header byte for PACKET_TYPE_BROADCAST_DATA (0x04), ext=0:
@@ -778,6 +812,8 @@ int main(void)
     RUN_TEST(test_cmd_callint_no_arg);
     RUN_TEST(test_cmd_callint_nonnumeric);
     RUN_TEST(test_cmd_callint_negative);
+    RUN_TEST(test_cmd_txgain_valid);
+    RUN_TEST(test_cmd_txgain_invalid);
     RUN_TEST(test_process_control_bytes_multiline);
     /* Status emitter tests */
     RUN_TEST(test_tnc_send_disconnected);

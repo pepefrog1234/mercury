@@ -45,6 +45,10 @@ input_device =
 ; Run mercury -z to list available devices.
 output_device =
 
+; TX audio output gain as a percentage. 100 = unity gain.
+; Range: 0..200 (default: 100)
+tx_audio_gain_percent = 100
+
 ; Capture input channel: left, right, or stereo (default: left)
 capture_channel = left
 

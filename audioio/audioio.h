@@ -46,6 +46,8 @@ int audioio_restart(const char *capture_dev, const char *playback_dev,
 
 int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback);
 int audioio_pick_default_subsystem(void);
+int audioio_set_playback_gain_percent(int percent);
+int audioio_get_playback_gain_percent(void);
 
 int tx_transfer(double *buffer, size_t len);
 int rx_transfer(double *buffer, size_t len);

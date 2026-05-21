@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 #include "os_interop.h"
 #include <ffaudio/audio.h>
@@ -223,6 +224,7 @@ static char s_playback_dev[256];
 static int s_buffers_initialized = 0;
 static int s_buffers_are_shm = 0;
 static volatile bool audio_shutdown_ = false;  // local stop flag for audio threads
+static atomic_int s_playback_gain_percent = ATOMIC_VAR_INIT(100);
 
 struct conf {
     const char *cmd;
@@ -236,6 +238,37 @@ struct conf {
 };
 
 #define AUDIOIO_MODEM_SAMPLE_RATE 8000
+
+int audioio_set_playback_gain_percent(int percent)
+{
+    if (percent < 0)
+        percent = 0;
+    if (percent > 200)
+        percent = 200;
+    atomic_store_explicit(&s_playback_gain_percent, percent, memory_order_relaxed);
+    return percent;
+}
+
+int audioio_get_playback_gain_percent(void)
+{
+    return atomic_load_explicit(&s_playback_gain_percent, memory_order_relaxed);
+}
+
+static int32_t audioio_apply_playback_gain(int32_t sample)
+{
+    int gain_percent = audioio_get_playback_gain_percent();
+    int64_t scaled;
+
+    if (gain_percent == 100)
+        return sample;
+
+    scaled = ((int64_t)sample * (int64_t)gain_percent) / 100;
+    if (scaled > INT32_MAX)
+        return INT32_MAX;
+    if (scaled < INT32_MIN)
+        return INT32_MIN;
+    return (int32_t)scaled;
+}
 
 static const char *audioio_format_name(unsigned format)
 {
@@ -639,7 +672,7 @@ void *radio_playback_thread(void *device_ptr)
                     (ch_layout == LEFT && ch == 0) ||
                     (ch_layout == RIGHT && ch == 1))
                 {
-                    out_sample = buffer_upsampled[i];
+                    out_sample = audioio_apply_playback_gain(buffer_upsampled[i]);
                 }
                 audioio_store_playback_sample(frame + ((size_t)ch * sample_bytes),
                                               cfg->format, out_sample);

@@ -98,7 +98,7 @@ static int parse_rx_channel_layout(const char *value)
 static void print_usage(const char *prog)
 {
     printf("Usage modes: \n");
-    printf("%s -m [mode_index] -i [device] -o [device] -x [sound_system] -p [arq_tcp_base_port] -b [broadcast_tcp_port] -f [freedv_verbosity] -H [hamlib_log_level] -k [rx_input_channel] [-G] [-T] [-U ui_port] [-W]\n", prog);
+    printf("%s -m [mode_index] -i [device] -o [device] -Y [tx_audio_gain_percent] -x [sound_system] -p [arq_tcp_base_port] -b [broadcast_tcp_port] -f [freedv_verbosity] -H [hamlib_log_level] -k [rx_input_channel] [-G] [-T] [-U ui_port] [-W]\n", prog);
     printf("%s [-h -l -z]\n", prog);
     printf("\nOptions:\n");
     printf(" -c [cpu_nr]                Run on CPU [cpu_nr]. Use -1 to disable CPU selection, which is the default.\n");
@@ -109,6 +109,7 @@ static void print_usage(const char *prog)
     printf(" -k [rx_input_channel]      Capture input channel: left, right, or stereo. Default is left.\n");
     printf(" -i [device]                Radio Capture device id (eg: \"plughw:0,0\").\n");
     printf(" -o [device]                Radio Playback device id (eg: \"plughw:0,0\").\n");
+    printf(" -Y [tx_audio_gain_percent] TX audio output gain percentage (0..200). Default is 100.\n");
     printf(" -x [sound_system]          Sets the sound system or IO API to use: alsa, pulse, dsound, wasapi or shm. Default is alsa on Linux and dsound on Windows.\n");
     printf(" -p [arq_tcp_base_port]     Sets the ARQ TCP base port (control is base_port, data is base_port + 1). Default is 8300.\n");
     printf(" -b [broadcast_tcp_port]    Sets the broadcast TCP port. Default is 8100.\n");
@@ -171,6 +172,7 @@ int main(int argc, char *argv[])
     int freedv_verbosity = 0;
     int hamlib_log_level = 0;
     int rx_input_channel = LEFT;
+    int tx_audio_gain_percent = 100;
     
     input_dev[0] = 0;
     output_dev[0] = 0;
@@ -184,7 +186,7 @@ int main(int argc, char *argv[])
 
     // --- Load init configuration file ---
     // First pass: extract -C config path only
-    const char *optstring = "hc:s:m:f:H:k:li:o:x:p:b:zvtrL:JR:U:A:C:SKWGT";
+    const char *optstring = "hc:s:m:f:H:k:Y:li:o:x:p:b:zvtrL:JR:U:A:C:SKWGT";
     const char *cfg_path = "mercury.ini";
     int opt;
     while ((opt = getopt(argc, argv, optstring)) != -1)
@@ -225,6 +227,7 @@ int main(int argc, char *argv[])
             verbose            = mcfg.verbose ? 1 : 0;
             freedv_verbosity   = mcfg.freedv_verbosity;
             hamlib_log_level   = mcfg.hamlib_log_level;
+            tx_audio_gain_percent = mcfg.tx_audio_gain_percent;
             radio_serial_speed = mcfg.radio_serial_speed;
         }
     }
@@ -302,6 +305,19 @@ int main(int argc, char *argv[])
                     return EXIT_FAILURE;
                 }
                 rx_input_channel = parsed_layout;
+            }
+            break;
+        case 'Y':
+            if (optarg)
+            {
+                char *endptr = NULL;
+                long gain_percent = strtol(optarg, &endptr, 10);
+                if (endptr == optarg || *endptr != '\0' || gain_percent < 0 || gain_percent > 200)
+                {
+                    fprintf(stderr, "Invalid TX audio gain '%s'. Valid range is 0..200 percent.\n", optarg);
+                    return EXIT_FAILURE;
+                }
+                tx_audio_gain_percent = (int)gain_percent;
             }
             break;
         case 'p':
@@ -584,6 +600,8 @@ int main(int argc, char *argv[])
     if (audio_system != AUDIO_SUBSYSTEM_SHM)
     {
         HLOGI("main", "Initializing I/O from Sound Card");
+        tx_audio_gain_percent = audioio_set_playback_gain_percent(tx_audio_gain_percent);
+        HLOGI("main", "TX audio output gain: %d%%", tx_audio_gain_percent);
         audioio_init_internal(input_dev, output_dev, audio_system, rx_input_channel, &radio_capture, &radio_playback);
     }
 
@@ -648,6 +666,7 @@ int main(int argc, char *argv[])
     mcfg.verbose           = verbose ? true : false;
     mcfg.freedv_verbosity  = freedv_verbosity;
     mcfg.hamlib_log_level  = hamlib_log_level;
+    mcfg.tx_audio_gain_percent = tx_audio_gain_percent;
     mcfg.radio_serial_speed = radio_serial_speed;
 
     ui_ctx_t ui_ctx;
