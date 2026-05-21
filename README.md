@@ -1,178 +1,155 @@
-# Mercury — HERMES HF Modem
+# Mercury fork — 短波數據機
 
-Mercury is part of the [HERMES project](https://www.rhizomatica.org/hermes/)
-(High-Frequency Emergency and Rural Multimedia Exchange System) by
-[Rhizomatica](https://www.rhizomatica.org/), funded by
-[ARDC](https://www.ardc.net/) and others.
+[English](README.en.md)
 
-There are currently two versions:
+這個儲存庫是 `pepefrog1234/mercury` 維護的 Mercury fork。它是從 Rhizomatica 的 HERMES Mercury 數據機專案 fork 而來，主要用於 Mercury Chat 與短波數位通訊測試。
 
-- **Mercury v2** (this branch) — a complete rewrite in C with a new ARQ data link. **This is the recommended version.**
-- **[Mercury v1](https://github.com/Rhizomatica/mercury/tree/mercuryv1)** — the original Mercury modem written in C++. Legacy; use only if you know what you are doing.
+本 fork 不是 Rhizomatica 官方版。若要和 Mercury Chat 搭配使用，建議雙方都使用這個 fork 或相容版本；本 fork 已修改 ARQ 協定與 TNC 行為，不能保證能和原版 Mercury 或其他未同步修改的版本互通。
 
-A Qt-based GUI is available: [mercury-qt](https://github.com/Rhizomatica/mercury-qt)
+## Fork 來源
 
-Mailing list: https://lists.riseup.net/www/info/hermes-general
+- 上游專案：Rhizomatica Mercury
+- 上游網址：https://github.com/Rhizomatica/mercury
+- Fork 分支：`mercuryv2`
+- 本 fork 分支：`mercuryv2`
+- 目前 fork 分岔點：上游 `mercuryv2` 的 `f308d5a`，commit 訊息為 `Add workflow to automate release process`
 
-## Mercury v2
+Mercury 本身是 HERMES 專案的一部分，由 Rhizomatica 開發。原始 Mercury v2 是以 C 重寫的短波數據機，提供 FreeDV DATAC 模式、ARQ 資料鏈路、廣播/信標、VARA 相容 TCP TNC 介面，以及 Hamlib / HERMES 電台控制。
 
-Mercury v2 is a complete rewrite of the HERMES modem ARQ data link,
-replacing the monolithic state machine with a modular reactor
-architecture featuring per-direction mode selection, hybrid
-SNR + delivery-feedback gear-shifting, split control/data channel
-design (DATAC13 for signaling, DATAC4/DATAC3/DATAC1 for payload),
-and a persistent FreeDV mode pool eliminating codec re-initialization
-overhead. Built for reliable store-and-forward email and file transfer
-over HF radio links in rural and emergency scenarios.
+## 這個 fork 改了什麼
 
-## What this software does
+### ARQ 協定與鏈路效率
 
-- **ARQ data link for P2P sessions** with connect/accept handshake, ACK/retry logic, keepalive, and controlled disconnect.
-- **Adaptive payload "gear-shifting"** (DATAC4/DATAC3/DATAC1) driven by link quality and backlog, with DATAC13 used for control signaling.
-- **Per-direction mode selection**: each path (A→B and B→A) negotiates its mode independently based on local SNR.
-- **Broadcast data mode** in parallel to ARQ, with dedicated broadcast framing and TCP ingress port.
-- **VARA-style TCP TNC interface** with separate control and data sockets (base port and base+1), including commands/status like `MYCALL`, `LISTEN`, `CONNECT`, `BUFFER`, `SN`, and `BITRATE`.
-- **Audio modem operation over multiple backends** (`alsa`, `pulse`, `dsound`, `wasapi`, `shm`) with split RX/TX modem orchestration.
-- **Direct radio control** via HAMLIB or HERMES shared-memory interface for direct PTT keying.
+- 導入 ARQ v5 空中協定的 burst DATA / cumulative ACK：
+  - DATAC4 維持單訊框傳輸。
+  - DATAC3 最多可在一次 PTT 中送 2 個 DATA 訊框。
+  - DATAC1 最多可在一次 PTT 中送 3 個 DATA 訊框。
+  - ACK 使用 cumulative ACK，遺失時只重送尚未確認的 burst 尾端。
+- 改善半雙工 turn-taking：
+  - 調整 ACK 後等待與 TURN_REQ timing，降低雙方互踩與過早切換風險。
+  - IRS 有本機待傳資料時，不會太快打斷對方，先給對方完成傳輸與 ACK 的空間。
+- 放寬閒置與 keepalive 行為：
+  - 將 IRS inactivity probe 調整為較適合人工聊天的時間尺度。
+  - 放寬 keepalive / idle disconnect 判斷，降低雙方仍在線但短時間未互動就斷線的機率。
+- 新增 ARQ 佔空比與 timing telemetry，用於觀察 PTT airtime、ACK 等待與酬載速率。
 
-```
-Usage modes:
-./mercury -m [mode_index] -i [device] -o [device] -x [sound_system] -p [arq_tcp_base_port] -b [broadcast_tcp_port] -f [freedv_verbosity] -H [hamlib_log_level] -k [rx_input_channel] [-G] [-T] [-U ui_port] [-W] [-C config_file]
-./mercury [-h -l -z]
+### 自適應速率與頻寬規則
 
-Options:
- -c [cpu_nr]                Run on CPU [cpu_nr]. Use -1 to disable CPU selection, which is the default.
- -m [mode_index]            Startup payload mode index shown in "-l" output. Used for broadcast and idle/disconnected ARQ decode. Default is 1 (DATAC3).
- -s [mode_index]            Legacy alias for -m.
- -f [freedv_verbosity]      FreeDV modem verbosity level (0..3). Default is 0.
- -H [hamlib_log_level]      Hamlib radio log level (0..6). Default is 0.
- -k [rx_input_channel]      Capture input channel: left, right, or stereo. Default is left.
- -i [device]                Radio Capture device id (eg: "plughw:0,0").
- -o [device]                Radio Playback device id (eg: "plughw:0,0").
- -x [sound_system]          Sets the sound system or IO API to use: alsa, pulse, dsound, wasapi or shm. Default is alsa on Linux and dsound on Windows.
- -p [arq_tcp_base_port]     Sets the ARQ TCP base port (control is base_port, data is base_port + 1). Default is 8300.
- -b [broadcast_tcp_port]    Sets the broadcast TCP port. Default is 8100.
- -G                         Enable UI communication (WebSocket status/spectrum/command interface for mercury-qt). Off by default.
- -T                         Use WSS (WebSocket Secure/TLS) for UI communication. Requires -G. Default uses plain WS (no TLS).
- -U [ui_port]               Sets the UI port (WebSocket port). Default is 10000. Requires -G.
- -W                         Disable waterfall/spectrum data sent to the UI (saves CPU). Requires -G.
- -l                         Lists all modulator/coding modes.
- -z                         Lists all available sound cards.
- -v                         Verbose mode. Prints more information during execution.
- -L [path]                  Write log to file (TIMING level and above).
- -J                         Write log file in JSONL format (requires -L).
- -R [radio_model]           Sets HAMLIB radio model.
- -A [radio_address]         Sets HAMLIB radio device file or ip:port address.
- -S                         Use HERMES shared memory radio control (Linux-only; do not use with -R and -A).
- -K                         List HAMLIB supported radio models.
- -C [path]                  Path to INI configuration file (default: mercury.ini in the current directory).
- -t                         Test TX mode.
- -r                         Test RX mode.
- -h                         Prints this help.
-```
+- ARQ 酬載使用 DATAC4 / DATAC3 / DATAC1 階梯式資料模式：
+  - DATAC4：最保守，約 87 bps，酬載 54 位元組。
+  - DATAC3：中速，約 321 bps，酬載 126 位元組。
+  - DATAC1：最快，約 980 bps，酬載 510 位元組。
+- DATAC13 固定用於控制訊框，例如 CALL、ACCEPT、ACK、TURN、KEEPALIVE、DISCONNECT、CQ，約 65 bps，酬載 14 位元組。
+- 寬頻寬連線不再長時間卡在 DATAC4：
+  - 允許短聊天酬載在 SNR 已知後升到 DATAC3。
+  - DATAC1 需要乾淨 ACK 歷史與足夠 SNR / 待傳資料量才會啟用。
+  - 發生重送或不穩定時會降速，並保留一段維持時間避免反覆跳速。
+- 500 Hz / 2300 Hz / 2750 Hz 規則更明確：
+  - `BW500` 嚴格維持窄頻寬酬載，固定使用 DATAC4；控制與信標仍使用 DATAC13。
+  - `BW2300` 和 `BW2750` 允許 DATAC4 → DATAC3 → DATAC1 自適應切換。
+  - `BW2750` 會保留在 CALL / ACCEPT / CONNECTED 回報中，方便 VARA 相容使用者辨識。
+- A→B 與 B→A 的模式判斷彼此獨立，因此雙方 GUI 看到的 TX/RX 速率可能不同。
 
-Mode behavior notes:
-- `-m` / `-s` affects **broadcast** and **test** modes only.
-- During an active ARQ link, control frames use DATAC13 and ARQ payload starts
-  in DATAC4. Wide links may adapt to DATAC3/DATAC1, including short chat
-  payloads once peer SNR is known. Connected wide-link receivers scan the
-  DATAC4/DATAC3/DATAC1 payload modes in parallel, allowing local Mercury peers
-  to switch DATA speed without a separate MODE_REQ/MODE_ACK exchange. DATAC1
-  remains gated by clean ACK history for field stability.
-- VARA `BW500` keeps payload on DATAC4 for a strict narrow transmit signal;
-  `BW2300` and `BW2750` both allow the full Mercury payload-mode ladder.
-- `CALL` advertises the local BW token and `ACCEPT` returns the negotiated
-  session token. If either side uses `BW500`, the link stays narrow; `BW2750`
-  is preserved in `CONNECTED ... BW` only when both peers advertise it.
-- `FSK_LDPC` is currently **experimental** (mainly for lab/test usage), may have longer decode/sync latency depending on setup, and is not recommended for production links yet.
+### TNC 介面與狀態回報
 
-Radio control notes:
-- With no `-R`, `-A`, or `-S`, Mercury does **not** key the radio directly; it leaves for the tcp client the radio keying task.
-- `-R` selects a HAMLIB model ID, `-A` optionally points HAMLIB at a device path or `ip:port`, and `-K` prints the available HAMLIB models.
-- `-S` selects the HERMES shared-memory controller interface, is mutually exclusive with `-A`, and is unavailable on Windows builds.
+- 保留 VARA-style TCP TNC 架構：
+  - 控制埠：預設 `8300`。
+  - 資料埠：預設 `8301`。
+  - 廣播/信標埠：預設 `8100`。
+- 新增或強化控制命令：
+  - `TXGAIN <0..200>`：即時設定 TX 音訊輸出音量百分比，`100` 為 unity gain。
+  - `CALLINT <seconds>`：調整 CALL / ACCEPT 重試間隔，`0` 可還原預設值。
+  - `BW2750`：接受並保留 2750 Hz token。
+  - `BUFFER`、`BITRATE`：保留可查詢狀態。
+  - `COMPRESSION ON/OFF`：為 VARA 相容客戶端保留的 no-op 命令。
+- 新增 `TXBITRATE (<level>) <bps> BPS` 非同步狀態，讓客戶端能分開顯示本機 TX 速率與對方 RX 速率。
+- `BITRATE (<level>) <bps> BPS` 會回報目前收到的酬載模式速率。
 
-## Configuration File
+## 速率表
 
-Mercury reads an INI-format configuration file at startup. The default path is `mercury.ini` in the current working directory; use `-C` to specify an alternative path. Command-line arguments take priority over file values. See the included [mercury.ini.example](mercury.ini.example) for all available settings and their defaults — copy it to `mercury.ini` and edit as needed.
+以下速率是 FreeDV DATAC 模式的名目位元速率，不等於聊天文字實際淨吞吐量。實際吞吐量還會受到 ARQ header、ACK、turn-taking、PTT 延遲、重送與 UTF-8 文字位元組數影響。
 
-## Getting Mercury
+| TNC 顯示 | FreeDV 模式 | 名目速率 | 每個數據機訊框酬載 | 用途 |
+| --- | --- | ---: | ---: | --- |
+| `L1` | DATAC1 | 約 980 bps | 510 位元組 | 高 SNR、寬頻寬、大 backlog 的最快資料模式 |
+| `L3` | DATAC3 | 約 321 bps | 126 位元組 | 寬頻寬聊天常見的中速資料模式 |
+| `L4` | DATAC4 | 約 87 bps | 54 位元組 | 窄頻寬與不穩定鏈路的保守資料模式 |
+| 控制 | DATAC13 | 約 65 bps | 14 位元組 | CALL、ACCEPT、ACK、TURN、KEEPALIVE、DISCONNECT、CQ |
 
-### Pre-built Binaries
+## 音效與跨平台修正
 
-**Windows:** Ready-to-run executables are available on the [GitHub Releases page](https://github.com/Rhizomatica/mercury/releases).
+- 修正 macOS CoreAudio 裝置解析：
+  - 可用裝置名稱解析到實際 CoreAudio 裝置 ID。
+  - 改善 A/B 本機回環、BlackHole、AetherSDR 類音效裝置設定時的可用性。
+- 修正音效回環 sample handling，避免 sample 格式與取樣率處理造成波形不正確。
+- Windows 音效裝置名稱解析：
+  - WASAPI 可接受易讀裝置名稱，並轉成 MMDevice ID。
+  - DirectSound 可接受易讀裝置名稱，並轉成 GUID。
+  - 避免 CAT/PTT 正常但音訊沒有真正送到指定音效卡的情況。
+- TX 音訊輸出音量控制：
+  - 命令列新增 `-Y <0..200>`。
+  - INI 設定新增 `tx_audio_gain_percent`。
+  - TNC 控制命令新增 `TXGAIN <0..200>`，可在不重啟數據機的情況下即時調整輸出音量。
 
-**Debian / Raspberry Pi OS:** A package repository is available for amd64 and arm64 (Debian 13 Trixie / Raspberry Pi OS). To install:
+## 建置與打包修正
 
-```
-# Install the repository certificate
-wget --no-check-certificate -qO- https://debian.hermes.radio/hermes/hermes.key | gpg --dearmor -o - | sudo tee /etc/apt/trusted.gpg.d/hermes.gpg > /dev/null
+- 修正 macOS build portability。
+- `Makefile` 支援使用設定的 archiver，改善 FreeDV 靜態函式庫打包。
+- 新增 fork 用 GitHub Actions：
+  - Debian 13.5 amd64 建置、測試、打包。
+  - Windows x64 MinGW 交叉編譯與 zip 打包。
+- Windows zip 會包含 `mercury.exe`、`mercury.ini.example` 與 Hamlib 相關 DLL。
 
-# For arm64 (Raspberry Pi, sBitx radio, etc.)
-echo 'deb [arch=arm64] http://debian.hermes.radio/hermes trixie main' | sudo tee -a /etc/apt/sources.list.d/hermes.list
+## 基本使用
 
-# For amd64 (laptop, desktop, etc.)
-echo 'deb [arch=amd64] http://debian.hermes.radio/hermes trixie main' | sudo tee -a /etc/apt/sources.list.d/hermes.list
+列出音效裝置：
 
-sudo apt update
-sudo apt install mercury
+```sh
+./mercury -z
 ```
 
-## Compilation
+列出 FreeDV 模式：
 
-Edit config.mk with your C compiler and appropriate flags (defaults should be fine for most) and type:
-
-```
-make
+```sh
+./mercury -l
 ```
 
-If you have `doxygen` installed, you can generate HTML documentation for the ARQ subsystem:
+啟動數據機，使用 CoreAudio、指定輸入/輸出裝置、設定 TNC 基礎連接埠：
 
-```
-make doxygen
-```
-
-Output will be generated in `docs/html/` (open `docs/html/index.html` in a browser). To remove generated docs:
-
-```
-make doxygen-clean
+```sh
+./mercury -x coreaudio -i "<input-device>" -o "<output-device>" -p 8300 -b 8100
 ```
 
-## Documentation
+設定 TX 音訊輸出音量為 80%：
 
-Online HTML docs: https://rhizomatica.github.io/mercury/
+```sh
+./mercury -Y 80
+```
 
-## Logging and timing traces
+更多啟動參數可用：
 
-- Default run (`./mercury`): logger runs at **INFO** level with timestamps (`[INF]/[WRN]/[ERR]`).
-- Verbose run (`./mercury -v`): logger runs at **DEBUG** level and includes all detailed ARQ/modem traces (`[DBG]` and `[TMG]`).
-- `./mercury -v -L /tmp/session.log` — write full DEBUG+TIMING log to file.
-- `./mercury -v -L /tmp/session.log -J` — same, but in **JSONL** format for machine parsing with `jq`.
-- TX state transitions are logged with timestamps at INFO level as:
-  - `TX enabled (PTT ON)`
-  - `TX disabled (PTT OFF)`
+```sh
+./mercury -h
+```
 
-See [docs/ARQ.md](docs/ARQ.md) for full ARQ architecture, protocol reference, and OTA tuning guide.
+## 設定檔
 
-## Physical Layer
+Mercury 會讀取 INI 格式設定檔。預設為目前目錄下的 `mercury.ini`，也可使用 `-C <path>` 指定。命令列參數優先於設定檔。
 
-Mercury v2 currently uses FreeDV modulator code developed by David Rowe. We plan to introduce other modulator modes present in Mercury v1.
+範例設定請看：
 
-## Graphical Interfaces
+- [mercury.ini.example](mercury.ini.example)
 
-Mercury v2 has two interfaces:
-- **Mercury-qt** (desktop): https://github.com/Rhizomatica/mercury-qt
-- **Web-based**: located in `docs/app/` in this repository, and accessible via https://rhizomatica.github.io/mercury/app/
+## 相關文件
 
-## About
+- [ARQ 架構與協定說明](docs/ARQ.md)
+- [TNC 指令參考](docs/TNC.md)
+- [原始 Rhizomatica Mercury](https://github.com/Rhizomatica/mercury)
+- [Mercury Chat](https://github.com/pepefrog1234/mercury-chat)
 
-Mercury v2 is developed by Rhizomatica's HERMES team, namely:
+## 授權
 
-- Rafael Diniz (ARQ, Broadcast, TCP interface, etc)
-- Pedro Messetti (Testing framework, general improvements, etc)
-- Matheus Thibau (Graphical User Interface)
+本 fork 延續上游授權。請參考：
 
-This project is sponsored by ARDC.
-
-## LICENSE
-
-Please check LICENSE and LICENSE-freedv.
+- [LICENSE](LICENSE)
+- [LICENSE-freedv](LICENSE-freedv)
